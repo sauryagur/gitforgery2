@@ -1,84 +1,176 @@
-// Package gitx holds small go-git helpers shared across gitforgery:
-// identity parsing, ref pattern matching, and read-only commit hash previews.
 package gitx
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
-// Identity is a parsed "Name <email>" identity from a recipe.
-type Identity struct {
-	Name  string
-	Email string
+func Run(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
-// String renders the identity in git's "Name <email>" form.
-func (i Identity) String() string {
-	return fmt.Sprintf("%s <%s>", i.Name, i.Email)
+func IsRepo(dir string) bool {
+	_, err := Run(dir, "rev-parse", "--is-inside-work-tree")
+	return err == nil
 }
 
-// ParseIdentity parses a git identity literal of the form "Name <email>".
-// Both name and email must be non-empty, mirroring what git itself demands
-// of committer identities. Surrounding whitespace is trimmed.
-func ParseIdentity(s string) (Identity, error) {
-	s = strings.TrimSpace(s)
-	open := strings.LastIndexByte(s, '<')
-	close := strings.LastIndexByte(s, '>')
-	if open == -1 || close == -1 || close < open {
-		return Identity{}, fmt.Errorf("invalid identity %q: want \"Name <email>\"", s)
-	}
-	name := strings.TrimSpace(s[:open])
-	email := s[open+1 : close]
-	if name == "" {
-		return Identity{}, fmt.Errorf("invalid identity %q: empty name", s)
-	}
-	if email == "" {
-		return Identity{}, fmt.Errorf("invalid identity %q: empty email", s)
-	}
-	return Identity{Name: name, Email: email}, nil
+func RepoRoot(dir string) (string, error) {
+	return Run(dir, "rev-parse", "--show-toplevel")
 }
 
-// MatchRefPattern reports whether ref matches a ref glob pattern such as
-// "refs/heads/*" or "refs/tags/v*". '*' matches any sequence of characters,
-// including '/', matching git refspec semantics rather than filepath.Match.
-// A pattern without '*' requires an exact match.
-func MatchRefPattern(pattern, ref string) bool {
-	parts := strings.Split(pattern, "*")
-	switch len(parts) {
-	case 1:
-		return pattern == ref
-	case 2:
-		prefix, suffix := parts[0], parts[1]
-		// Strict inequality: '*' must consume at least one character, so
-		// "refs/heads/*" does not degenerate onto its own prefix.
-		return len(ref) > len(prefix)+len(suffix) &&
-			strings.HasPrefix(ref, prefix) &&
-			strings.HasSuffix(ref, suffix)
-	default:
-		return matchMultiStar(parts, ref)
-	}
+func GitDir(repo string) (string, error) {
+	return Run(repo, "rev-parse", "--git-dir")
 }
 
-// matchMultiStar matches ref against pattern segments joined by '*'.
-// Each middle segment must occur, in order, after the previous match;
-// the last segment must terminate ref.
-func matchMultiStar(parts []string, ref string) bool {
-	first, last := parts[0], parts[len(parts)-1]
-	middle := parts[1 : len(parts)-1]
-	if len(ref) <= len(first)+len(last) ||
-		!strings.HasPrefix(ref, first) ||
-		!strings.HasSuffix(ref, last) {
-		return false
-	}
-	pos := len(first)
-	end := len(ref) - len(last)
-	for _, seg := range middle {
-		idx := strings.Index(ref[pos:end], seg)
-		if idx == -1 {
-			return false
+func CurrentTip(repo string) (string, error) {
+	return Run(repo, "rev-parse", "HEAD")
+}
+
+func TreeOf(repo, ref string) (string, error) {
+	return Run(repo, "rev-parse", ref+"^{tree}")
+}
+
+func DefaultRange(repo string) (string, error) {
+	// try upstream merge-base
+	up, err := Run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err == nil && up != "" {
+		mb, err := Run(repo, "merge-base", "HEAD", up)
+		if err == nil && mb != "" {
+			return mb + "..HEAD", nil
 		}
-		pos += idx + len(seg)
 	}
-	return true
+	// fallback: last 5 commits
+	return "HEAD~5..HEAD", nil
+}
+
+func FormatPatch(repo, rangeSpec, outDir string) error {
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	_, err := Run(repo, "format-patch", rangeSpec, "-o", outDir)
+	return err
+}
+
+func PatchFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(e.Name(), ".patch") {
+			files = append(files, filepath.Join(dir, e.Name()))
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+func ApplyCheck(repo string, patches []string) error {
+	if len(patches) == 0 {
+		return nil
+	}
+	args := append([]string{"apply", "--check"}, patches...)
+	_, err := Run(repo, args...)
+	return err
+}
+
+func Am(repo string, patches []string) error {
+	if len(patches) == 0 {
+		return nil
+	}
+	args := append([]string{"am"}, patches...)
+	_, err := Run(repo, args...)
+	return err
+}
+
+func CreateBackupRef(repo string) error {
+	tip, err := CurrentTip(repo)
+	if err != nil {
+		return err
+	}
+	_, err = Run(repo, "update-ref", "refs/gitforgery2/original", tip)
+	return err
+}
+
+func ForcePush(repo, remote, branch string) error {
+	_, err := Run(repo, "push", "--force", remote, "HEAD:"+branch)
+	return err
+}
+
+func RemoteBranch(repo string) (string, string, error) {
+	up, err := Run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+	if err != nil {
+		return "", "", err
+	}
+	// up like origin/main
+	parts := strings.SplitN(up, "/", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("unexpected upstream: %s", up)
+	}
+	return parts[0], parts[1], nil
+}
+func ResultingTree(repo, base string, patches []string) (string, error) {
+	if base == "" {
+		base = "HEAD"
+	}
+	if len(patches) == 0 {
+		tree, err := TreeOf(repo, base)
+		return tree, err
+	}
+	tmpIndex, err := os.CreateTemp("", "gitforgery2-index-*")
+	if err != nil {
+		return "", err
+	}
+	tmpIndex.Close()
+	defer os.Remove(tmpIndex.Name())
+	env := append(os.Environ(), "GIT_INDEX_FILE="+tmpIndex.Name())
+	read := exec.Command("git", "read-tree", base)
+	read.Dir = repo
+	read.Env = env
+	if out, err := read.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("read-tree: %w\n%s", err, string(out))
+	}
+	applyArgs := append([]string{"apply", "--cached"}, patches...)
+	apply := exec.Command("git", applyArgs...)
+	apply.Dir = repo
+	apply.Env = env
+	if out, err := apply.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("apply --cached: %w\n%s", err, string(out))
+	}
+	write := exec.Command("git", "write-tree")
+	write.Dir = repo
+	write.Env = env
+	out, err := write.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("write-tree: %w\n%s", err, string(out))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+func RangeBase(repo, rangeSpec string) (string, error) {
+	parts := strings.SplitN(rangeSpec, "..", 2)
+	base := strings.TrimSpace(parts[0])
+	if base == "" {
+		return "", fmt.Errorf("invalid range: %s", rangeSpec)
+	}
+	out, err := Run(repo, "rev-parse", base+"^{commit}")
+	if err != nil {
+		out, err = Run(repo, "rev-parse", base)
+	}
+	return out, err
 }
