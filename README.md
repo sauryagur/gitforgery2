@@ -25,15 +25,112 @@ Flow: select harness → confirm the commit range → review the generated
 instruction → run the harness → review/edit patches → accept → confirm
 force-push.
 
+## Keys
+
+`Ctrl+C` quits at any time. Review mode has a view mode and an edit mode; the
+selected patch is shown in the diff pane.
+
+### Setup
+
+| Key | Action |
+| --- | --- |
+| `up` / `k` | Move selection up |
+| `down` / `j` | Move selection down |
+| `enter` | Use the selected harness and save the choice to config |
+
+### Range
+
+| Key | Action |
+| --- | --- |
+| typing | Edit the range (e.g. `HEAD~3..HEAD`) |
+| `enter` | Accept the range; an empty range uses the repo default |
+
+### Generate instruction
+
+| Key | Action |
+| --- | --- |
+| `esc` | Skip instruction generation and go to the instruction screen |
+
+### Instruction
+
+| Key | Action |
+| --- | --- |
+| typing | Edit the instruction |
+| `tab` | Toggle "Don't modify final state" (see [Safety](#safety)) |
+| `enter` | Accept the instruction and run the harness |
+
+An empty instruction defaults to `improve commit messages`.
+
+### Run
+
+The harness streams its output while it runs; there are no per-screen keys
+besides `Ctrl+C`.
+
+### Review (view mode)
+
+| Key | Action |
+| --- | --- |
+| `up` / `k` | Select previous patch |
+| `down` / `j` | Select next patch |
+| `pgup` / `pgdown` | Scroll the diff a page |
+| `ctrl+u` / `ctrl+d` | Scroll the diff half a page |
+| `home` / `end` | Jump to the top / bottom of the diff |
+| `e` | Edit the selected patch |
+| `r` | Reprompt the harness with a revised instruction |
+| `a` / `enter` | Accept the patches and go to confirmation |
+| `q` / `esc` | Abort and discard the temp patch directory |
+
+### Review (edit mode)
+
+| Key | Action |
+| --- | --- |
+| `ctrl+s` | Save the patch and return to view mode |
+| `esc` | Discard changes and return to view mode |
+| typing | Edit the patch in the textarea |
+
+### Confirm force-push
+
+| Key | Action |
+| --- | --- |
+| `y` / `enter` | Force-push the rewritten history |
+| `n` / `q` / `esc` | Abort before pushing |
+
+### Done
+
+| Key | Action |
+| --- | --- |
+| `enter` / `q` | Exit |
+
 ## Safety
 
 - The pre-rewrite tip is saved as `refs/gitforgery2/original`.
-- With "Don't modify final state" enabled, all patches are applied to a
-  temporary index built from the range base and the resulting tree OID must
-  match the snapshot; otherwise the run aborts, keeps the temp patch directory,
-  and prints a diff summary. No force-push happens.
+- "Don't modify final state" is **OFF by default**; press `tab` on the
+  instruction screen to turn it on. This is the opt-in guarantee from RFC §5.
+  With it enabled, all patches are applied to a temporary index built from the
+  range base and the resulting tree OID must match the snapshot; otherwise the
+  run aborts, prints a diff summary, and no force-push happens.
+- On a final-state mismatch or a harness failure, the temporary patch directory
+  is kept and its path is printed on the error screen, so the generated patches
+  can be inspected or reused.
 - The harness prompt is the only thing sent to the harness; no API keys are
   stored by this tool.
+
+## Recovery
+
+If a run aborts or a push fails, the original tip is still available through
+the backup ref. Restore the branch exactly as it was:
+
+```sh
+git reset --hard refs/gitforgery2/original
+```
+
+The TUI reuses the harness choice persisted at
+`~/.config/gitforgery2/config.json`. To make it ask again (for example after
+installing or removing `pi`, `codex`, or `claude`), reset that file:
+
+```sh
+rm ~/.config/gitforgery2/config.json
+```
 
 ## Test
 

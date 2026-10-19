@@ -202,3 +202,54 @@ func TestFlowFinalStateEnforced(t *testing.T) {
 		t.Fatalf("HEAD moved on abort: %s != %s", got, fr.tip)
 	}
 }
+
+// TestStartRunRejectsNonHEADRange verifies the range is validated against HEAD
+// before any backup ref, snapshot, or patch directory is created.
+func TestStartRunRejectsNonHEADRange(t *testing.T) {
+	fr := flowSetupRepo(t)
+
+	m := flowModel(fr.dir, "")
+	m.rangeSpec = "HEAD~2..HEAD~1"
+	msg := startRunResult(m, nil)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "range must end at HEAD") {
+		t.Fatalf("err = %v, want range must end at HEAD", msg.err)
+	}
+	if msg.patchDir != "" {
+		t.Fatalf("patchDir = %q, want empty", msg.patchDir)
+	}
+	if refExists(t, fr.dir, "refs/gitforgery2/original") {
+		t.Fatal("backup ref was created before range validation")
+	}
+}
+
+// TestStartRunRejectsDirtyWorktree verifies uncommitted tracked changes abort
+// the run before anything is written.
+func TestStartRunRejectsDirtyWorktree(t *testing.T) {
+	fr := flowSetupRepo(t)
+	if err := os.WriteFile(filepath.Join(fr.dir, "f.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := flowModel(fr.dir, "")
+	msg := startRunResult(m, nil)
+	if msg.err == nil || !strings.Contains(msg.err.Error(), "uncommitted changes") {
+		t.Fatalf("err = %v, want uncommitted changes", msg.err)
+	}
+	if msg.patchDir != "" {
+		t.Fatalf("patchDir = %q, want empty", msg.patchDir)
+	}
+	if refExists(t, fr.dir, "refs/gitforgery2/original") {
+		t.Fatal("backup ref was created for a dirty worktree")
+	}
+	if got := flowGit(t, fr.dir, "rev-parse", "HEAD"); got != fr.tip {
+		t.Fatalf("HEAD moved on dirty-worktree abort: %s != %s", got, fr.tip)
+	}
+}
+
+// refExists reports whether ref resolves in repo.
+func refExists(t *testing.T, repo, ref string) bool {
+	t.Helper()
+	cmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref)
+	cmd.Dir = repo
+	return cmd.Run() == nil
+}

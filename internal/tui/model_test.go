@@ -214,3 +214,38 @@ func TestWheelMovesReviewSelection(t *testing.T) {
 		t.Fatalf("selected = %d, want 0 after wheel over the diff pane", m.selected)
 	}
 }
+
+// TestConfirmNamesPushTarget checks the confirm screen names the resolved
+// upstream and reports when it could not be resolved.
+func TestConfirmNamesPushTarget(t *testing.T) {
+	m := testModel()
+	m.screen = scrConfirm
+	m.width, m.height = 120, 40
+	m.resize()
+	m.pushRemote = "origin"
+	m.pushBranch = "main"
+	if got := m.viewContent(); !strings.Contains(got, "origin/main") {
+		t.Fatalf("confirm view does not name the push target:\n%s", got)
+	}
+
+	m.pushErr = "no upstream"
+	if got := m.viewContent(); !strings.Contains(got, "no upstream") || !strings.Contains(got, "n/q abort") {
+		t.Fatalf("confirm view does not show the push error and abort hint:\n%s", got)
+	}
+	if _, cmd := m.handleKey("y"); cmd != nil {
+		t.Fatal("confirm started a push while pushErr was set")
+	}
+}
+
+// TestPushRequiresTarget verifies doPush fails closed when no upstream was
+// resolved instead of guessing one at push time.
+func TestPushRequiresTarget(t *testing.T) {
+	m := testModel()
+	msg, ok := m.doPush()().(pushResultMsg)
+	if !ok {
+		t.Fatal("doPush did not return a pushResultMsg")
+	}
+	if msg.err == nil {
+		t.Fatal("doPush succeeded without a push target")
+	}
+}
