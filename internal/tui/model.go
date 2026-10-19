@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -74,9 +75,12 @@ type Model struct {
 	// pushRemote/pushBranch name the upstream resolved on the review screen;
 	// pushErr records why it could not be resolved so the confirm screen can
 	// refuse to push instead of dying mid-rewrite.
-	pushRemote  string
-	pushBranch  string
-	pushErr     string
+	pushRemote string
+	pushBranch string
+	pushErr    string
+	// pushing is set while doPush is in flight so the confirm screen ignores
+	// repeated confirmations until the result arrives.
+	pushing     bool
 	instrInput  textinput.Model
 	instruction string
 	// instructionStatus is shown while generating and on the instruction
@@ -97,6 +101,10 @@ type Model struct {
 	// as the short label in the review screen's patch list.
 	patchNames []string
 	runErr     error
+	// runCancel aborts the in-flight run/generation; cancelled marks a run the
+	// user stopped so its (error) result is discarded instead of reported.
+	runCancel context.CancelFunc
+	cancelled bool
 
 	// runCh streams harness stdout/stderr lines while a command runs;
 	// runOutput accumulates them for outputViewport, which shows the live
@@ -199,6 +207,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if keyMsg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		// Ignore input while a push is in flight so the confirm (or any other
+		// queued key) cannot start a second push.
+		if m.pushing {
+			return m, nil
+		}
 		// In the review screen's view mode the pager keys scroll the diff
 		// viewport; every other key keeps its selection/edit/accept behavior
 		// below (and in handleKey).
@@ -255,6 +268,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case runResultMsg:
+		if m.cancelled {
+			// The user cancelled this run; drop its (cancellation) error and
+			// keep the patch directory the aborted run left behind.
+			m.cancelled = false
+			m.patchDir = msg.patchDir
+			return m, nil
+		}
 		m.runCh = nil
 		m.reprompting = false
 		m.patchDir = msg.patchDir
@@ -274,6 +294,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.originalTree = msg.tree
 		}
 		m.runStatus = "done"
+		m.runCancel = nil
 		m.pushErr = ""
 		m.pushRemote = ""
 		m.pushBranch = ""
@@ -285,6 +306,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resize()
 		return m, nil
 	case pushResultMsg:
+		m.pushing = false
 		if msg.err != nil {
 			m.finalErr = msg.err
 			m.finalMsg = msg.err.Error()
@@ -303,6 +325,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.runCh = nil
+		m.runCancel = nil
 		m.screen = scrInstruction
 		if msg.err != nil {
 			m.instructionStatus = "generation failed: " + msg.err.Error()
@@ -451,6 +474,11 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 		}
 	case scrGenerate:
 		if key == "esc" {
+			// Cancel the in-flight generation so its child process dies.
+			if m.runCancel != nil {
+				m.runCancel()
+				m.runCancel = nil
+			}
 			// Bump the sequence so any in-flight generation result is dropped.
 			m.generateSeq++
 			m.screen = scrInstruction
@@ -461,6 +489,17 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			if m.runCh != nil {
 				return m, waitForRun(m.runCh)
 			}
+		}
+	case scrRun:
+		if key == "esc" {
+			if m.runCancel != nil {
+				m.runCancel()
+				m.runCancel = nil
+			}
+			m.cancelled = true
+			m.finalErr = fmt.Errorf("cancelled")
+			m.finalMsg = "cancelled"
+			m.screen = scrDone
 		}
 	case scrInstruction:
 		switch key {
@@ -543,9 +582,10 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 	case scrConfirm:
 		switch key {
 		case "y", "enter":
-			if m.pushErr != "" {
+			if m.pushErr != "" || m.pushing {
 				return m, nil
 			}
+			m.pushing = true
 			return m, m.doPush()
 		case "n", "q", "esc":
 			m.cleanup()

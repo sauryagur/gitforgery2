@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -210,7 +211,7 @@ func TestStartRunRejectsNonHEADRange(t *testing.T) {
 
 	m := flowModel(fr.dir, "")
 	m.rangeSpec = "HEAD~2..HEAD~1"
-	msg := startRunResult(m, nil)
+	msg := startRunResult(m, context.Background(), nil)
 	if msg.err == nil || !strings.Contains(msg.err.Error(), "range must end at HEAD") {
 		t.Fatalf("err = %v, want range must end at HEAD", msg.err)
 	}
@@ -231,7 +232,7 @@ func TestStartRunRejectsDirtyWorktree(t *testing.T) {
 	}
 
 	m := flowModel(fr.dir, "")
-	msg := startRunResult(m, nil)
+	msg := startRunResult(m, context.Background(), nil)
 	if msg.err == nil || !strings.Contains(msg.err.Error(), "uncommitted changes") {
 		t.Fatalf("err = %v, want uncommitted changes", msg.err)
 	}

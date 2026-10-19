@@ -249,3 +249,78 @@ func TestPushRequiresTarget(t *testing.T) {
 		t.Fatal("doPush succeeded without a push target")
 	}
 }
+
+// TestConfirmIgnoredWhilePushing verifies that a second confirmation while a
+// push is already in flight does not start another push.
+func TestConfirmIgnoredWhilePushing(t *testing.T) {
+	m := testModel()
+	m.screen = scrConfirm
+	m.pushRemote = "origin"
+	m.pushBranch = "main"
+
+	nm, cmd := m.handleKey("y")
+	if cmd == nil {
+		t.Fatal("first confirm did not start a push")
+	}
+	if !nm.pushing {
+		t.Fatal("first confirm did not mark the push in flight")
+	}
+	nm2, cmd2 := nm.handleKey("y")
+	if cmd2 != nil {
+		t.Fatal("second confirm started a duplicate push")
+	}
+	if !nm2.pushing {
+		t.Fatal("second confirm cleared the in-flight flag")
+	}
+	if got := nm2.viewContent(); !strings.Contains(got, "Pushing...") {
+		t.Fatalf("confirm view does not show the push in flight:\n%s", got)
+	}
+}
+
+// TestEscOnRunCancels verifies that esc on the run screen cancels the run,
+// lands on the done screen, and keeps the patch directory of the aborted run.
+func TestEscOnRunCancels(t *testing.T) {
+	m := testModel()
+	m.screen = scrRun
+	m.patchDir = "/tmp/gitforgery2-keep"
+	cancelled := false
+	m.runCancel = func() { cancelled = true }
+
+	nm, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if !cancelled {
+		t.Fatal("esc on the run screen did not cancel the run")
+	}
+	if cmd != nil {
+		t.Fatal("esc on the run screen returned a command")
+	}
+	got := nm.(Model)
+	if !got.cancelled {
+		t.Fatal("cancelled flag not set")
+	}
+	if got.screen != scrDone {
+		t.Fatalf("screen = %d, want scrDone", got.screen)
+	}
+	if got.finalMsg != "cancelled" || got.finalErr == nil {
+		t.Fatalf("final message = %q, err = %v", got.finalMsg, got.finalErr)
+	}
+	if got.runCancel != nil {
+		t.Fatal("runCancel not cleared after cancel")
+	}
+
+	// The run's cancellation error must not overwrite the done screen, and the
+	// aborted run's patch directory must be retained.
+	after, cmd := got.Update(runResultMsg{patchDir: "/tmp/gitforgery2-keep", err: os.ErrDeadlineExceeded})
+	if cmd != nil {
+		t.Fatal("cancelled run result returned a command")
+	}
+	done := after.(Model)
+	if done.screen != scrDone || done.finalMsg != "cancelled" {
+		t.Fatalf("cancelled run result changed the done screen: screen=%d msg=%q", done.screen, done.finalMsg)
+	}
+	if done.patchDir != "/tmp/gitforgery2-keep" {
+		t.Fatalf("patch dir = %q, want retained", done.patchDir)
+	}
+	if done.cancelled {
+		t.Fatal("cancelled flag not reset after the run result")
+	}
+}
