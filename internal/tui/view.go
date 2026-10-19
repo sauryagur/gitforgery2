@@ -48,10 +48,13 @@ func (m Model) viewContent() string {
 		b.WriteString("\n\nTab: don't modify final state = " + boolStr(m.dontModify))
 		return m.renderForm("Instruction", b.String(), "Enter run")
 	case scrRun:
-		return m.renderForm("Running", m.outputViewport.View(), m.spinner.View()+" "+m.runStatus)
+		return m.renderForm("Running", m.outputViewport.View(), m.spinner.View()+" "+m.runStatus+" · esc cancel")
 	case scrReview:
 		return m.renderReview()
 	case scrConfirm:
+		if m.pushing {
+			return m.renderForm("Confirm force-push", "Pushing...", "please wait")
+		}
 		var b strings.Builder
 		b.WriteString("Force-push the rewritten history?")
 		_, _ = fmt.Fprintf(&b, "\n\n%d patch(es) will be applied", len(m.patches))

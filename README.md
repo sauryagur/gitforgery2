@@ -63,8 +63,14 @@ An empty instruction defaults to `improve commit messages`.
 
 ### Run
 
-The harness streams its output while it runs; there are no per-screen keys
-besides `Ctrl+C`.
+The harness streams its output while it runs.
+
+| Key | Action |
+| --- | --- |
+| `esc` | Cancel the run (kills the harness child and keeps the temp patch directory) |
+| `ctrl+c` | Quit the TUI |
+
+A run is also capped by a 3-minute timeout.
 
 ### Review (view mode)
 
