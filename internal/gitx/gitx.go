@@ -55,6 +55,16 @@ func DefaultRange(repo string) (string, error) {
 	return "HEAD~5..HEAD", nil
 }
 
+// Log returns the git log for rangeSpec formatted for prompt input. The
+// --max-count=200 cap keeps large ranges from producing unbounded output.
+func Log(repo, rangeSpec string) (string, error) {
+	if strings.TrimSpace(rangeSpec) == "" {
+		rangeSpec = "HEAD"
+	}
+	return Run(repo, "log", "--no-merges", "--max-count=200", "--date=iso",
+		"--format=%h %ad %an <%ae>%n%s%n%b%n----", rangeSpec)
+}
+
 func FormatPatch(repo, rangeSpec, outDir string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
@@ -124,6 +134,11 @@ func RemoteBranch(repo string) (string, string, error) {
 		return "", "", fmt.Errorf("unexpected upstream: %s", up)
 	}
 	return parts[0], parts[1], nil
+}
+
+// DiffStat returns the trimmed `git diff --stat` output between two trees.
+func DiffStat(repo, oldTree, newTree string) (string, error) {
+	return Run(repo, "diff", "--stat", oldTree, newTree)
 }
 func ResultingTree(repo, base string, patches []string) (string, error) {
 	if base == "" {

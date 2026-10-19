@@ -11,6 +11,7 @@ type Config struct {
 	Harness string `json:"harness"`
 	Version string `json:"version,omitempty"`
 }
+
 func Dir() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {

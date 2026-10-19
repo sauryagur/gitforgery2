@@ -25,8 +25,6 @@ type Snapshot struct {
 	Tree string `json:"tree"`
 }
 
-
-
 func path(repo string) string {
 	return filepath.Join(dir(repo), "snapshot")
 }
