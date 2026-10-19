@@ -320,11 +320,18 @@ func (m *Model) doPush() tea.Cmd {
 		if err := git.CleanWorktree(repo); err != nil {
 			return pushResultMsg{err: err}
 		}
+		snap, err := snapshot.Load(repo)
+		if err != nil {
+			return pushResultMsg{err: fmt.Errorf("final state check failed: %w", err)}
+		}
+		cur, err := git.CurrentTip(repo)
+		if err != nil {
+			return pushResultMsg{err: err}
+		}
+		if cur != snap.Tip {
+			return pushResultMsg{err: fmt.Errorf("HEAD moved since the run (now %s, expected %s); aborting to avoid discarding new commits", cur, snap.Tip)}
+		}
 		if m.dontModify {
-			snap, err := snapshot.Load(repo)
-			if err != nil {
-				return pushResultMsg{err: fmt.Errorf("final state check failed: %w", err)}
-			}
 			if err := m.checkFinalState(snap.Tree); err != nil {
 				return pushResultMsg{err: err}
 			}

@@ -3,7 +3,7 @@ package harness
 import (
 	"os"
 	"path/filepath"
-	"strings"
+	"slices"
 	"testing"
 )
 
@@ -52,10 +52,11 @@ func TestCommandShapes(t *testing.T) {
 		name string
 		h    Harness
 		bin  string
+		args []string // expected args before the prompt
 	}{
-		{"pi", Pi{}, "pi"},
-		{"codex", Codex{}, "codex"},
-		{"claude", Claude{}, "claude"},
+		{"pi", Pi{}, "pi", []string{"-p", "--no-session", "--mode", "text"}},
+		{"codex", Codex{}, "codex", []string{"exec", "--skip-git-repo-check", "-s", "workspace-write", "--ephemeral"}},
+		{"claude", Claude{}, "claude", []string{"-p", "--permission-mode", "acceptEdits"}},
 	}
 
 	const prompt = "improve commit messages"
@@ -64,8 +65,9 @@ func TestCommandShapes(t *testing.T) {
 		if bin != tt.bin {
 			t.Errorf("%s Command binary = %q, want %q", tt.name, bin, tt.bin)
 		}
-		if !strings.Contains(strings.Join(args, " "), prompt) {
-			t.Errorf("%s Command args %q do not contain prompt %q", tt.name, args, prompt)
+		want := append(append([]string{}, tt.args...), prompt)
+		if !slices.Equal(args, want) {
+			t.Errorf("%s Command args = %q, want %q", tt.name, args, want)
 		}
 	}
 }

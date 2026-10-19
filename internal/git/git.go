@@ -135,7 +135,7 @@ func Am(repo string, patches []string) error {
 	if len(patches) == 0 {
 		return nil
 	}
-	args := append([]string{"am"}, patches...)
+	args := append([]string{"am", "--empty=keep"}, patches...)
 	_, err := Run(repo, args...)
 	return err
 }
@@ -206,7 +206,7 @@ func ResultingTree(repo, base string, patches []string) (string, error) {
 		return "", err
 	}
 	defer cleanup()
-	applyArgs := append([]string{"apply", "--cached"}, patches...)
+	applyArgs := append([]string{"apply", "--cached", "--allow-empty"}, patches...)
 	apply := exec.Command("git", applyArgs...)
 	apply.Dir = repo
 	apply.Env = env

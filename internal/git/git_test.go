@@ -352,3 +352,56 @@ func TestForcePushContext(t *testing.T) {
 		t.Fatalf("ForcePush with cancelled context took %v, want prompt failure", elapsed)
 	}
 }
+
+func TestEmptyCommitReplay(t *testing.T) {
+	repo := newTestRepo(t)
+	gitRun(t, repo, "commit", "--allow-empty", "-m", "empty")
+
+	base, err := Run(repo, "rev-parse", "HEAD~2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tipTree, err := TreeOf(repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	if err := FormatPatch(repo, "HEAD~2..HEAD", dir); err != nil {
+		t.Fatalf("FormatPatch: %v", err)
+	}
+	patches, err := PatchFiles(dir)
+	if err != nil {
+		t.Fatalf("PatchFiles: %v", err)
+	}
+	if len(patches) != 2 {
+		t.Fatalf("PatchFiles returned %d patches, want 2", len(patches))
+	}
+
+	tree, err := ResultingTree(repo, base, patches)
+	if err != nil {
+		t.Fatalf("ResultingTree: %v", err)
+	}
+	if tree != tipTree {
+		t.Fatalf("ResultingTree = %s, want %s", tree, tipTree)
+	}
+
+	gitRun(t, repo, "reset", "--hard", base)
+	if err := Am(repo, patches); err != nil {
+		t.Fatalf("Am: %v", err)
+	}
+	newTree, err := TreeOf(repo, "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newTree != tipTree {
+		t.Fatalf("HEAD tree after Am = %s, want %s", newTree, tipTree)
+	}
+	subjects, err := Run(repo, "log", "--format=%s", "HEAD~2..HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(subjects, "empty") {
+		t.Fatalf("replayed history subjects = %q, want to contain empty commit subject", subjects)
+	}
+}

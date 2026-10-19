@@ -24,14 +24,17 @@ type Codex struct{}
 
 func (Codex) Name() string { return "codex" }
 func (Codex) Command(prompt string) (string, []string) {
-	return "codex", []string{"exec", prompt}
+	// The patch directory is not a git repo and runs are non-interactive, so
+	// skip the repo check, allow workspace writes, and avoid session state.
+	return "codex", []string{"exec", "--skip-git-repo-check", "-s", "workspace-write", "--ephemeral", prompt}
 }
 
 type Claude struct{}
 
 func (Claude) Name() string { return "claude" }
 func (Claude) Command(prompt string) (string, []string) {
-	return "claude", []string{"-p", prompt}
+	// -p runs headless; acceptEdits lets it edit patch files without prompting.
+	return "claude", []string{"-p", "--permission-mode", "acceptEdits", prompt}
 }
 
 func Detect() []string {
