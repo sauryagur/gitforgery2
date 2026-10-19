@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -46,7 +47,17 @@ func DefaultRange(repo string) (string, error) {
 			return mb + "..HEAD", nil
 		}
 	}
-	// fallback: last 5 commits
+	// fallback: up to the last 5 commits, clamped to the repo's history so a
+	// short repo does not produce an invalid "HEAD~5" range.
+	if out, err := Run(repo, "rev-list", "--count", "HEAD"); err == nil {
+		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil && n >= 2 {
+			k := n - 1
+			if k > 5 {
+				k = 5
+			}
+			return fmt.Sprintf("HEAD~%d..HEAD", k), nil
+		}
+	}
 	return "HEAD~5..HEAD", nil
 }
 

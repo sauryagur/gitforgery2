@@ -48,3 +48,40 @@ func TestLog(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultRangeClampsToHistory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	gitRun(t, repo, "init")
+	gitRun(t, repo, "config", "user.email", "test@example.com")
+	gitRun(t, repo, "config", "user.name", "Test User")
+
+	commitN := func(n int) {
+		for i := 1; i <= n; i++ {
+			name := filepath.Join(repo, "f.txt")
+			if err := os.WriteFile(name, []byte(strings.Repeat("x", i)+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			gitRun(t, repo, "add", "f.txt")
+			gitRun(t, repo, "commit", "-m", "commit")
+		}
+	}
+	commitN(3)
+	got, err := DefaultRange(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "HEAD~2..HEAD" {
+		t.Fatalf("DefaultRange with 3 commits = %q, want HEAD~2..HEAD", got)
+	}
+	commitN(5)
+	got, err = DefaultRange(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "HEAD~5..HEAD" {
+		t.Fatalf("DefaultRange with 8 commits = %q, want HEAD~5..HEAD", got)
+	}
+}
