@@ -21,10 +21,14 @@ func TestFormatPatchRoundTrip(t *testing.T) {
 	run("init", "-q")
 	run("config", "user.email", "a@b.com")
 	run("config", "user.name", "A")
-	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hello"), 0o644)
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	run("add", "f.txt")
 	run("commit", "-q", "-m", "first")
-	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hello2"), 0o644)
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hello2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	run("add", "f.txt")
 	run("commit", "-q", "-m", "second")
 

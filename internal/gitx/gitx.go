@@ -21,11 +21,6 @@ func Run(dir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func IsRepo(dir string) bool {
-	_, err := Run(dir, "rev-parse", "--is-inside-work-tree")
-	return err == nil
-}
-
 func RepoRoot(dir string) (string, error) {
 	return Run(dir, "rev-parse", "--show-toplevel")
 }
@@ -140,6 +135,7 @@ func RemoteBranch(repo string) (string, string, error) {
 func DiffStat(repo, oldTree, newTree string) (string, error) {
 	return Run(repo, "diff", "--stat", oldTree, newTree)
 }
+
 func ResultingTree(repo, base string, patches []string) (string, error) {
 	if base == "" {
 		base = "HEAD"
@@ -152,8 +148,10 @@ func ResultingTree(repo, base string, patches []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tmpIndex.Close()
-	defer os.Remove(tmpIndex.Name())
+	if err := tmpIndex.Close(); err != nil {
+		return "", err
+	}
+	defer func() { _ = os.Remove(tmpIndex.Name()) }()
 	env := append(os.Environ(), "GIT_INDEX_FILE="+tmpIndex.Name())
 	read := exec.Command("git", "read-tree", base)
 	read.Dir = repo
@@ -177,6 +175,7 @@ func ResultingTree(repo, base string, patches []string) (string, error) {
 	}
 	return strings.TrimSpace(string(out)), nil
 }
+
 func RangeBase(repo, rangeSpec string) (string, error) {
 	parts := strings.SplitN(rangeSpec, "..", 2)
 	base := strings.TrimSpace(parts[0])

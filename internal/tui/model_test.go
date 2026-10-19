@@ -20,11 +20,12 @@ import (
 // harness detection, so rendering can be exercised in isolation.
 func testModel() Model {
 	return Model{
-		rangeInput: textinput.New(),
-		instrInput: textinput.New(),
-		textarea:   textarea.New(),
-		viewport:   viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
-		spinner:    spinner.New(),
+		rangeInput:     textinput.New(),
+		instrInput:     textinput.New(),
+		textarea:       textarea.New(),
+		viewport:       viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
+		outputViewport: viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
+		spinner:        spinner.New(),
 	}
 }
 

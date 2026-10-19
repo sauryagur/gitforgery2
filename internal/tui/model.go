@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,6 +57,12 @@ type instructionResultMsg struct {
 	err  error
 }
 
+// harnessOutputMsg carries a single line of harness stdout/stderr streamed
+// live while a harness command runs.
+type harnessOutputMsg struct {
+	line string
+}
+
 type Model struct {
 	screen int
 
@@ -93,13 +101,18 @@ type Model struct {
 	patchNames []string
 	runErr     error
 
+	// runCh streams harness stdout/stderr lines while a command runs;
+	// runOutput accumulates them for outputViewport, which shows the live
+	// output on the run and generate screens.
+	runCh          chan tea.Msg
+	runOutput      []string
+	outputViewport viewport.Model
+
 	selected     int
 	textarea     textarea.Model
 	viewport     viewport.Model
 	editing      bool
 	reviewStatus string
-
-	confirmMsg string
 
 	finalMsg string
 	finalErr error
@@ -114,15 +127,16 @@ func New(repo string) Model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	m := Model{
-		screen:     scrSetup,
-		width:      80,
-		height:     24,
-		repo:       repo,
-		rangeInput: ti,
-		instrInput: textinput.New(),
-		textarea:   ta,
-		viewport:   viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
-		spinner:    sp,
+		screen:         scrSetup,
+		width:          80,
+		height:         24,
+		repo:           repo,
+		rangeInput:     ti,
+		instrInput:     textinput.New(),
+		textarea:       ta,
+		viewport:       viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
+		outputViewport: viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
+		spinner:        sp,
 	}
 	m.instrInput.Placeholder = "rewrite commit messages to be concise"
 	m.available = harness.Detect()
@@ -228,7 +242,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.resize()
 		return m, nil
+	case harnessOutputMsg:
+		m.runOutput = append(m.runOutput, msg.line)
+		if len(m.runOutput) > maxRunOutputLines {
+			m.runOutput = m.runOutput[len(m.runOutput)-maxRunOutputLines:]
+		}
+		m.outputViewport.SetContent(strings.Join(m.runOutput, "\n"))
+		m.outputViewport.GotoBottom()
+		// Keep draining on any screen so background output never blocks the
+		// harness process.
+		if m.runCh != nil {
+			return m, waitForRun(m.runCh)
+		}
+		return m, nil
 	case runResultMsg:
+		m.runCh = nil
 		m.reprompting = false
 		m.patchDir = msg.patchDir
 		m.patches = msg.patches
@@ -262,8 +290,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case instructionResultMsg:
 		if msg.seq != m.generateSeq {
+			// Superseded generation: its output is already stale, and runCh
+			// may now belong to a newer run, so leave the drain alone.
 			return m, nil
 		}
+		m.runCh = nil
 		m.screen = scrInstruction
 		if msg.err != nil {
 			m.instructionStatus = "generation failed: " + msg.err.Error()
@@ -302,15 +333,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKey(key string) (Model, tea.Cmd) {
 	switch m.screen {
 	case scrSetup:
-		if key == "up" || key == "k" {
+		switch key {
+		case "up", "k":
 			if m.setupIdx > 0 {
 				m.setupIdx--
 			}
-		} else if key == "down" || key == "j" {
+		case "down", "j":
 			if m.setupIdx < len(m.available)-1 {
 				m.setupIdx++
 			}
-		} else if key == "enter" {
+		case "enter":
 			if len(m.available) == 0 {
 				m.finalErr = fmt.Errorf("no harness found; install pi, codex, or claude")
 				m.finalMsg = m.finalErr.Error()
@@ -367,11 +399,17 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.screen = scrInstruction
 			m.instrInput.Focus()
 			m.instructionStatus = "generation skipped"
+			// Keep draining the skipped generation's output so its writer
+			// never blocks; the stale result leaves the drain alone.
+			if m.runCh != nil {
+				return m, waitForRun(m.runCh)
+			}
 		}
 	case scrInstruction:
-		if key == "tab" {
+		switch key {
+		case "tab":
 			m.dontModify = !m.dontModify
-		} else if key == "enter" {
+		case "enter":
 			m.instrInput.Blur()
 			m.instructionStatus = ""
 			m.instruction = strings.TrimSpace(m.instrInput.Value())
@@ -380,13 +418,16 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			}
 			m.screen = scrRun
 			if m.reprompting {
-				return m, m.rerunHarness()
+				cmd := m.rerunHarness()
+				return m, cmd
 			}
-			return m, m.startRun()
+			cmd := m.startRun()
+			return m, cmd
 		}
 	case scrReview:
 		if m.editing {
-			if key == "ctrl+s" {
+			switch key {
+			case "ctrl+s":
 				if m.selected >= len(m.patches) {
 					return m, nil
 				}
@@ -399,7 +440,7 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				m.textarea.Blur()
 				m.reviewStatus = "saved"
 				m.refreshPatchView()
-			} else if key == "esc" {
+			case "esc":
 				m.editing = false
 				m.textarea.Blur()
 			}
@@ -435,9 +476,10 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.screen = scrDone
 		}
 	case scrConfirm:
-		if key == "y" || key == "enter" {
+		switch key {
+		case "y", "enter":
 			return m, m.doPush()
-		} else if key == "n" || key == "q" || key == "esc" {
+		case "n", "q", "esc":
 			m.cleanup()
 			m.finalMsg = "aborted before push"
 			m.screen = scrDone
@@ -510,6 +552,17 @@ func (m *Model) resize() {
 	m.viewport.SetHeight(innerH)
 	m.textarea.SetWidth(innerW)
 	m.textarea.SetHeight(innerH)
+
+	ow := m.formBoxWidth() - 2
+	if ow < 1 {
+		ow = 1
+	}
+	oh := m.height - 6
+	if oh < 3 {
+		oh = 3
+	}
+	m.outputViewport.SetWidth(ow)
+	m.outputViewport.SetHeight(oh)
 	m.refreshPatchView()
 }
 
@@ -618,124 +671,222 @@ func stripPatchPrefix(subject string) string {
 	return subject
 }
 
+// maxRunOutputLines bounds the retained harness output so a chatty command
+// cannot grow runOutput without limit.
+const maxRunOutputLines = 5000
+
+// streamCommand runs bin/args in dir, streams every stdout/stderr line to ch
+// as harnessOutputMsg, and returns the full combined output.
+func streamCommand(ctx context.Context, bin string, args []string, dir string, ch chan<- tea.Msg) (string, error) {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = dir
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	var lines []string
+	scanned := make(chan struct{})
+	go func() {
+		defer close(scanned)
+		sc := bufio.NewScanner(pr)
+		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for sc.Scan() {
+			line := sc.Text()
+			lines = append(lines, line)
+			if ch != nil {
+				ch <- harnessOutputMsg{line: line}
+			}
+		}
+		if sc.Err() != nil {
+			// A single line exceeded the buffer: keep reading (and dropping)
+			// so the child's writer never blocks.
+			_, _ = io.Copy(io.Discard, pr)
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		<-scanned
+		return "", err
+	}
+	// The scanner consumes the pipe while the command runs, so the writer
+	// never blocks; Wait then returns once both process and output are done.
+	waitErr := cmd.Wait()
+	_ = pw.Close()
+	<-scanned
+	return strings.Join(lines, "\n"), waitErr
+}
+
+// waitForRun returns a command that delivers the next message from ch, or nil
+// once the channel is closed.
+func waitForRun(ch chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
 // generateInstruction feeds the current git log for the confirmed range to the
 // selected harness and asks it for a plain-text rewrite instruction.
 func (m *Model) generateInstruction() tea.Cmd {
 	m.generateSeq++
 	seq := m.generateSeq
-	repo := m.repo
-	rangeSpec := m.rangeSpec
-	h := m.h
+	mc := *m
+	ch := make(chan tea.Msg, 256)
+	m.runCh = ch
+	m.runOutput = nil
+	m.outputViewport.SetContent("")
 	return func() tea.Msg {
-		if h == nil {
-			return instructionResultMsg{seq: seq, err: fmt.Errorf("no harness selected")}
-		}
-		log, err := gitx.Log(repo, rangeSpec)
-		if err != nil {
-			return instructionResultMsg{seq: seq, err: err}
-		}
-		if strings.TrimSpace(log) == "" {
-			return instructionResultMsg{seq: seq, err: fmt.Errorf("no commits in range %s", rangeSpec)}
-		}
-		prompt, err := harness.InstructionPrompt(log)
-		if err != nil {
-			return instructionResultMsg{seq: seq, err: err}
-		}
-		bin, args := h.Command(prompt)
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, bin, args...)
-		cmd.Dir = repo
-		out, err := cmd.Output()
-		if err != nil {
-			var ee *exec.ExitError
-			if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-				return instructionResultMsg{seq: seq, err: fmt.Errorf("harness failed: %w\n%s", err, string(ee.Stderr))}
-			}
-			return instructionResultMsg{seq: seq, err: fmt.Errorf("harness failed: %w", err)}
-		}
-		text := strings.TrimSpace(string(out))
-		if text == "" {
-			return instructionResultMsg{seq: seq, err: fmt.Errorf("harness produced an empty instruction")}
-		}
-		return instructionResultMsg{seq: seq, text: text}
+		go func() {
+			defer close(ch)
+			ch <- generateInstructionResult(mc, seq, ch)
+		}()
+		return waitForRun(ch)()
 	}
 }
 
-func (m *Model) startRun() tea.Cmd {
-	return func() tea.Msg {
-		repo := m.repo
-		if err := gitx.CreateBackupRef(repo); err != nil {
-			return runResultMsg{err: err}
-		}
-		tip, err := gitx.CurrentTip(repo)
-		if err != nil {
-			return runResultMsg{err: err}
-		}
-		tree, err := gitx.TreeOf(repo, "HEAD")
-		if err != nil {
-			return runResultMsg{err: err}
-		}
-		m.originalTree = tree
-		if err := snapshot.Save(repo, snapshot.Snapshot{Tip: tip, Tree: tree}); err != nil {
-			return runResultMsg{err: err}
-		}
-
-		tmp, err := os.MkdirTemp("", "gitforgery2-patches-*")
-		if err != nil {
-			return runResultMsg{err: err}
-		}
-		if err := gitx.FormatPatch(repo, m.rangeSpec, tmp); err != nil {
-			return runResultMsg{err: err}
-		}
-		patches, err := gitx.PatchFiles(tmp)
-		if err != nil {
-			return runResultMsg{err: err}
-		}
-		bin, args := m.h.Command(editPrompt(m.instruction))
-		cmd := exec.Command(bin, args...)
-		cmd.Dir = tmp
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return runResultMsg{patchDir: tmp, patches: patches, err: fmt.Errorf("harness failed: %w\n%s", err, string(out))}
-		}
-		if m.dontModify {
-			if err := m.checkFinalState(tree); err != nil {
-				return runResultMsg{patchDir: tmp, patches: patches, err: err}
-			}
-		}
-		return runResultMsg{patchDir: tmp, patches: patches, tree: tree}
+// generateInstructionResult does the work of generateInstruction in the
+// background; m is a snapshot so the goroutine never reads the live Model.
+func generateInstructionResult(m Model, seq int, ch chan tea.Msg) instructionResultMsg {
+	repo := m.repo
+	rangeSpec := m.rangeSpec
+	h := m.h
+	if h == nil {
+		return instructionResultMsg{seq: seq, err: fmt.Errorf("no harness selected")}
 	}
+	log, err := gitx.Log(repo, rangeSpec)
+	if err != nil {
+		return instructionResultMsg{seq: seq, err: err}
+	}
+	if strings.TrimSpace(log) == "" {
+		return instructionResultMsg{seq: seq, err: fmt.Errorf("no commits in range %s", rangeSpec)}
+	}
+	prompt, err := harness.InstructionPrompt(log)
+	if err != nil {
+		return instructionResultMsg{seq: seq, err: err}
+	}
+	bin, args := h.Command(prompt)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	out, err := streamCommand(ctx, bin, args, repo, ch)
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return instructionResultMsg{seq: seq, err: fmt.Errorf("harness failed: %w\n%s", err, string(ee.Stderr))}
+		}
+		return instructionResultMsg{seq: seq, err: fmt.Errorf("harness failed: %w", err)}
+	}
+	text := strings.TrimSpace(out)
+	if text == "" {
+		return instructionResultMsg{seq: seq, err: fmt.Errorf("harness produced an empty instruction")}
+	}
+	return instructionResultMsg{seq: seq, text: text}
+}
+
+func (m *Model) startRun() tea.Cmd {
+	mc := *m
+	ch := make(chan tea.Msg, 256)
+	m.runCh = ch
+	m.runOutput = nil
+	m.outputViewport.SetContent("")
+	return func() tea.Msg {
+		go func() {
+			defer close(ch)
+			ch <- startRunResult(mc, ch)
+		}()
+		return waitForRun(ch)()
+	}
+}
+
+// startRunResult backs up the current history, materialises the patches and
+// runs the harness in the patch directory; m is a snapshot of the Model.
+func startRunResult(m Model, ch chan tea.Msg) runResultMsg {
+	repo := m.repo
+	if err := gitx.CreateBackupRef(repo); err != nil {
+		return runResultMsg{err: err}
+	}
+	tip, err := gitx.CurrentTip(repo)
+	if err != nil {
+		return runResultMsg{err: err}
+	}
+	tree, err := gitx.TreeOf(repo, "HEAD")
+	if err != nil {
+		return runResultMsg{err: err}
+	}
+	if err := snapshot.Save(repo, snapshot.Snapshot{Tip: tip, Tree: tree}); err != nil {
+		return runResultMsg{err: err}
+	}
+
+	tmp, err := os.MkdirTemp("", "gitforgery2-patches-*")
+	if err != nil {
+		return runResultMsg{err: err}
+	}
+	if err := gitx.FormatPatch(repo, m.rangeSpec, tmp); err != nil {
+		return runResultMsg{err: err}
+	}
+	patches, err := gitx.PatchFiles(tmp)
+	if err != nil {
+		return runResultMsg{err: err}
+	}
+	m.patches = patches
+	bin, args := m.h.Command(editPrompt(m.instruction))
+	out, err := streamCommand(context.Background(), bin, args, tmp, ch)
+	if err != nil {
+		return runResultMsg{patchDir: tmp, patches: patches, err: fmt.Errorf("harness failed: %w\n%s", err, out)}
+	}
+	if m.dontModify {
+		if err := checkFinalState(m, tree); err != nil {
+			return runResultMsg{patchDir: tmp, patches: patches, err: err}
+		}
+	}
+	return runResultMsg{patchDir: tmp, patches: patches, tree: tree}
 }
 
 // rerunHarness re-runs the harness against the existing patch directory after
 // the user edits the instruction. Unlike startRun it must not create a backup
 // ref, save a snapshot, or re-run format-patch (which would discard edits).
 func (m *Model) rerunHarness() tea.Cmd {
+	mc := *m
+	ch := make(chan tea.Msg, 256)
+	m.runCh = ch
+	m.runOutput = nil
+	m.outputViewport.SetContent("")
 	return func() tea.Msg {
-		if m.patchDir == "" || len(m.patches) == 0 {
-			return runResultMsg{err: fmt.Errorf("nothing to reprompt: no patches")}
-		}
-		bin, args := m.h.Command(editPrompt(m.instruction))
-		cmd := exec.Command(bin, args...)
-		cmd.Dir = m.patchDir
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			return runResultMsg{patchDir: m.patchDir, patches: m.patches, err: fmt.Errorf("harness failed: %w\n%s", err, string(out))}
-		}
-		if m.dontModify {
-			if err := m.checkFinalState(m.originalTree); err != nil {
-				return runResultMsg{patchDir: m.patchDir, patches: m.patches, err: err}
-			}
-		}
-		return runResultMsg{patchDir: m.patchDir, patches: m.patches}
+		go func() {
+			defer close(ch)
+			ch <- rerunHarnessResult(mc, ch)
+		}()
+		return waitForRun(ch)()
 	}
+}
+
+// rerunHarnessResult re-runs the harness over the existing patch directory;
+// m is a snapshot of the Model.
+func rerunHarnessResult(m Model, ch chan tea.Msg) runResultMsg {
+	if m.patchDir == "" || len(m.patches) == 0 {
+		return runResultMsg{err: fmt.Errorf("nothing to reprompt: no patches")}
+	}
+	bin, args := m.h.Command(editPrompt(m.instruction))
+	out, err := streamCommand(context.Background(), bin, args, m.patchDir, ch)
+	if err != nil {
+		return runResultMsg{patchDir: m.patchDir, patches: m.patches, err: fmt.Errorf("harness failed: %w\n%s", err, out)}
+	}
+	if m.dontModify {
+		if err := checkFinalState(m, m.originalTree); err != nil {
+			return runResultMsg{patchDir: m.patchDir, patches: m.patches, err: err}
+		}
+	}
+	return runResultMsg{patchDir: m.patchDir, patches: m.patches}
 }
 
 // checkFinalState verifies that applying all patches to m.rangeBase yields
 // wantTree (RFC §5). It fails closed: any error computing the resulting tree
 // is returned, and a mismatch reports a diff summary.
-func (m Model) checkFinalState(wantTree string) error {
+func checkFinalState(m Model, wantTree string) error {
 	got, err := gitx.ResultingTree(m.repo, m.rangeBase, m.patches)
 	if err != nil {
 		return fmt.Errorf("final state check failed: %w", err)
@@ -748,6 +899,13 @@ func (m Model) checkFinalState(wantTree string) error {
 		return fmt.Errorf("final state modified:\n%s", summary)
 	}
 	return nil
+}
+
+// checkFinalState is the Model method form used by the flow; it delegates to
+// the package-level helper so the streaming goroutines can call it with a
+// Model snapshot.
+func (m Model) checkFinalState(wantTree string) error {
+	return checkFinalState(m, wantTree)
 }
 
 // editPrompt is the harness prompt used by both the initial run and reprompts.
@@ -845,7 +1003,7 @@ func (m Model) viewContent() string {
 	case scrRange:
 		return m.renderForm("Commit range", m.rangeInput.View(), "Enter continue")
 	case scrGenerate:
-		return m.renderForm("Generating instruction", m.spinner.View()+" "+m.instructionStatus, "esc skip")
+		return m.renderForm("Generating instruction", m.outputViewport.View(), m.spinner.View()+" "+m.instructionStatus+" · esc skip")
 	case scrInstruction:
 		var b strings.Builder
 		if m.instructionStatus != "" {
@@ -855,16 +1013,13 @@ func (m Model) viewContent() string {
 		b.WriteString("\n\nTab: don't modify final state = " + boolStr(m.dontModify))
 		return m.renderForm("Instruction", b.String(), "Enter run")
 	case scrRun:
-		return m.renderForm("Running", m.spinner.View()+" "+m.runStatus, "")
+		return m.renderForm("Running", m.outputViewport.View(), m.spinner.View()+" "+m.runStatus)
 	case scrReview:
 		return m.renderReview()
 	case scrConfirm:
 		var b strings.Builder
 		b.WriteString("Force-push the rewritten history?")
-		b.WriteString(fmt.Sprintf("\n\n%d patch(es) will be applied", len(m.patches)))
-		if m.confirmMsg != "" {
-			b.WriteString("\n\n" + m.confirmMsg)
-		}
+		_, _ = fmt.Fprintf(&b, "\n\n%d patch(es) will be applied", len(m.patches))
 		return m.renderForm("Confirm force-push", b.String(), "y/n")
 	case scrDone:
 		if m.finalErr != nil {

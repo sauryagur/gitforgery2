@@ -3,9 +3,8 @@ SHELL := /bin/bash
 
 BINARY     := gitforgery
 MODULE     := $(shell go list -m)
-VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 GOFLAGS    := -trimpath
-LDFLAGS    := -s -w -X '$(MODULE)/cmd.version=$(VERSION)'
+LDFLAGS    := -s -w
 
 .PHONY: all build install test test-race vet lint fmt fmt-fix tidy cover \
 	release snapshot clean help
