@@ -45,11 +45,16 @@ selected patch is shown in the diff pane.
 | typing | Edit the range (e.g. `HEAD~3..HEAD`) |
 | `enter` | Accept the range; an empty range uses the repo default |
 
+The range must be linear (no merge commits) and must end at `HEAD`. Merge
+base syntax such as `A...B` is rejected.
+
 ### Generate instruction
 
 | Key | Action |
 | --- | --- |
 | `esc` | Skip instruction generation and go to the instruction screen |
+
+Instruction generation is capped by the same 3-minute timeout as a run.
 
 ### Instruction
 
@@ -58,6 +63,7 @@ selected patch is shown in the diff pane.
 | typing | Edit the instruction |
 | `tab` | Toggle "Don't modify final state" (see [Safety](#safety)) |
 | `enter` | Accept the instruction and run the harness |
+| `esc` | Return to the Range screen |
 
 An empty instruction defaults to `improve commit messages`.
 
@@ -70,7 +76,8 @@ The harness streams its output while it runs.
 | `esc` | Cancel the run (kills the harness child and keeps the temp patch directory) |
 | `ctrl+c` | Quit the TUI |
 
-A run is also capped by a 3-minute timeout.
+A run is also capped by a 3-minute timeout, as are instruction generation and
+reprompts.
 
 ### Review (view mode)
 
@@ -109,7 +116,11 @@ A run is also capped by a 3-minute timeout.
 
 ## Safety
 
-- The pre-rewrite tip is saved as `refs/gitforgery2/original`.
+- The pre-rewrite tip is saved as `refs/gitforgery2/original`. This backup ref
+  is write-once per original tip: it is created if absent, but an existing
+  backup ref is never overwritten. To rewrite again from a new tip, move or
+  delete the old backup ref first (e.g. `git update-ref -d
+  refs/gitforgery2/original`).
 - "Don't modify final state" is **OFF by default**; press `tab` on the
   instruction screen to turn it on. This is the opt-in guarantee from RFC §5.
   With it enabled, all patches are applied to a temporary index built from the

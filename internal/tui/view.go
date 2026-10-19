@@ -36,7 +36,11 @@ func (m Model) viewContent() string {
 		}
 		return m.renderForm("Select harness", b.String(), "Enter select · Ctrl+C quit")
 	case scrRange:
-		return m.renderForm("Commit range", m.rangeInput.View(), "Enter continue")
+		body := m.rangeInput.View()
+		if m.rangeErr != "" {
+			body = errorStyle.Render(m.rangeErr) + "\n\n" + body
+		}
+		return m.renderForm("Commit range", body, "Enter continue")
 	case scrGenerate:
 		return m.renderForm("Generating instruction", m.outputViewport.View(), m.spinner.View()+" "+m.instructionStatus+" · esc skip")
 	case scrInstruction:

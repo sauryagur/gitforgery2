@@ -52,7 +52,10 @@ func DefaultRange(repo string) (string, error) {
 	// fallback: up to the last 5 commits, clamped to the repo's history so a
 	// short repo does not produce an invalid "HEAD~5" range.
 	if out, err := Run(repo, "rev-list", "--count", "HEAD"); err == nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil && n >= 2 {
+		if n, err := strconv.Atoi(strings.TrimSpace(out)); err == nil {
+			if n < 2 {
+				return "", fmt.Errorf("repository needs at least 2 commits to rewrite a range")
+			}
 			k := n - 1
 			if k > 5 {
 				k = 5
@@ -131,10 +134,21 @@ func Am(repo string, patches []string) error {
 	return err
 }
 
+// CreateBackupRef records the current tip under refs/gitforgery2/original.
+// The ref is write-once per original tip: an existing ref is a no-op when it
+// already names the tip, and an error otherwise so earlier history is never
+// silently overwritten.
 func CreateBackupRef(repo string) error {
 	tip, err := CurrentTip(repo)
 	if err != nil {
 		return err
+	}
+	existing, err := Run(repo, "rev-parse", "--verify", "--quiet", "refs/gitforgery2/original")
+	if err == nil && existing != "" {
+		if existing == tip {
+			return nil
+		}
+		return fmt.Errorf("backup ref refs/gitforgery2/original already points to %s, but current tip is %s; delete or move the ref before rewriting again", existing, tip)
 	}
 	_, err = Run(repo, "update-ref", "refs/gitforgery2/original", tip)
 	return err
@@ -244,6 +258,16 @@ func ParseRange(repo, spec string) (base, end string, err error) {
 	end, err = verify("end", end)
 	if err != nil {
 		return "", "", err
+	}
+	if base == end {
+		return "", "", fmt.Errorf("range is empty")
+	}
+	merges, err := Run(repo, "rev-list", "--merges", base+".."+end)
+	if err != nil {
+		return "", "", fmt.Errorf("checking range for merge commits: %w", err)
+	}
+	if merges != "" {
+		return "", "", fmt.Errorf("range contains merge commits; use a linear range (rebase or --first-parent) before rewriting")
 	}
 	return base, end, nil
 }

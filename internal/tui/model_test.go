@@ -324,3 +324,154 @@ func TestEscOnRunCancels(t *testing.T) {
 		t.Fatal("cancelled flag not reset after the run result")
 	}
 }
+
+// TestCtrlCOnRunCancelsAndCleans verifies that Ctrl+C during a run cancels the
+// in-flight run, removes the aborted run's patch directory and quits.
+func TestCtrlCOnRunCancelsAndCleans(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "patches")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := testModel()
+	m.screen = scrRun
+	m.patchDir = dir
+	cancelled := false
+	m.runCancel = func() { cancelled = true }
+
+	nm, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if !cancelled {
+		t.Fatal("ctrl+c on the run screen did not cancel the run")
+	}
+	if cmd == nil {
+		t.Fatal("ctrl+c on the run screen did not return a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("ctrl+c on the run screen did not return a quit command")
+	}
+	got := nm.(Model)
+	if got.runCancel != nil {
+		t.Fatal("runCancel not cleared after ctrl+c")
+	}
+	if got.patchDir != "" {
+		t.Fatalf("patch dir = %q, want cleared", got.patchDir)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("patch dir still present after ctrl+c: %v", err)
+	}
+}
+
+// TestCtrlCIgnoredWhilePushing verifies that Ctrl+C cannot quit while a push
+// is in flight.
+func TestCtrlCIgnoredWhilePushing(t *testing.T) {
+	m := testModel()
+	m.pushing = true
+	nm, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if cmd != nil {
+		t.Fatal("ctrl+c returned a command while pushing")
+	}
+	if got := nm.(Model); !got.pushing {
+		t.Fatal("ctrl+c cleared the in-flight push flag")
+	}
+}
+
+// TestResizePreservesEditingText verifies that resizing the terminal while a
+// patch is being edited reflows the widgets without reloading the patch.
+func TestResizePreservesEditingText(t *testing.T) {
+	patches, names := realPatches(t)
+	m := testModel()
+	m.screen = scrReview
+	m.width, m.height = 120, 40
+	m.patches = patches
+	m.patchNames = names
+	m.resize()
+
+	m.editing = true
+	m.loadSelectedPatch()
+	m.textarea.SetValue("unsaved edit")
+	m.textarea.Focus()
+
+	nm, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	got := nm.(Model)
+	if got.textarea.Value() != "unsaved edit" {
+		t.Fatalf("textarea after resize = %q, want the unsaved edit", got.textarea.Value())
+	}
+	if !got.editing {
+		t.Fatal("resize cleared the editing flag")
+	}
+	if got.width != 100 || got.height != 30 {
+		t.Fatalf("size after resize = %dx%d, want 100x30", got.width, got.height)
+	}
+}
+
+// TestInvalidRangeStaysInline verifies that a bad range reports the error on
+// the range screen instead of ending the flow.
+func TestInvalidRangeStaysInline(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	run("config", "user.email", "a@b.com")
+	run("config", "user.name", "A")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "f.txt")
+	run("commit", "-q", "-m", "first")
+
+	m := testModel()
+	m.repo = repo
+	m.screen = scrRange
+	m.rangeInput.Focus()
+	m.rangeInput.SetValue("no-such-ref..HEAD")
+
+	nm, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("invalid range started a command")
+	}
+	got := nm.(Model)
+	if got.screen != scrRange {
+		t.Fatalf("screen = %d, want scrRange", got.screen)
+	}
+	if got.rangeErr == "" {
+		t.Fatal("invalid range did not set rangeErr")
+	}
+	if got.finalErr != nil {
+		t.Fatalf("invalid range ended the flow: %v", got.finalErr)
+	}
+	if !strings.Contains(got.viewContent(), "invalid range") {
+		t.Fatalf("range view does not show the inline error:\n%s", got.viewContent())
+	}
+}
+
+// TestEscBacksOutOfInstruction verifies that esc on the instruction screen
+// returns to the range screen with the typed instruction preserved.
+func TestEscBacksOutOfInstruction(t *testing.T) {
+	m := testModel()
+	m.screen = scrInstruction
+	m.instructionStatus = "generated; edit and press enter"
+	m.instrInput.SetValue("make it concise")
+	m.instrInput.Focus()
+
+	nm, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	if cmd != nil {
+		t.Fatal("esc on the instruction screen returned a command")
+	}
+	got := nm.(Model)
+	if got.screen != scrRange {
+		t.Fatalf("screen = %d, want scrRange", got.screen)
+	}
+	if got.instrInput.Value() != "make it concise" {
+		t.Fatalf("instruction after esc = %q, want preserved", got.instrInput.Value())
+	}
+	if got.instrInput.Focused() {
+		t.Fatal("instruction input still focused after esc")
+	}
+	if !got.rangeInput.Focused() {
+		t.Fatal("range input not focused after esc")
+	}
+}
