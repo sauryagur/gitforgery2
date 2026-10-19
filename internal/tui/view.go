@@ -27,20 +27,27 @@ func (m Model) viewContent() string {
 				if i > 0 {
 					b.WriteString("\n")
 				}
+				label := h
+				if v := m.harnessVersions[h]; v != "" {
+					label = h + " (" + v + ")"
+				}
 				if i == m.setupIdx {
-					b.WriteString(selectedItemStyle.Render("> " + h))
+					b.WriteString(selectedItemStyle.Render("> " + label))
 				} else {
-					b.WriteString("  " + h)
+					b.WriteString("  " + label)
 				}
 			}
 		}
 		return m.renderForm("Select harness", b.String(), "Enter select · Ctrl+C quit")
 	case scrRange:
 		body := m.rangeInput.View()
+		if label := m.harnessLabel(); label != "" {
+			body = helpStyle.Render("harness: "+label) + "\n\n" + body
+		}
 		if m.rangeErr != "" {
 			body = errorStyle.Render(m.rangeErr) + "\n\n" + body
 		}
-		return m.renderForm("Commit range", body, "Enter continue")
+		return m.renderForm("Commit range", body, "Enter continue · Ctrl+H switch harness")
 	case scrGenerate:
 		return m.renderForm("Generating instruction", m.outputViewport.View(), m.spinner.View()+" "+m.instructionStatus+" · esc skip")
 	case scrInstruction:
@@ -121,10 +128,7 @@ func (m Model) renderReview() string {
 	if innerLW < 1 {
 		innerLW = 1
 	}
-	visible := bodyH - 3 // borders plus title row
-	if visible < 1 {
-		visible = 1
-	}
+	start, visible := m.reviewListStart()
 	// patchNames is populated when patches are produced; fall back to file
 	// names if a caller left it unset so the list is never blank.
 	labels := m.patchNames
@@ -133,16 +137,6 @@ func (m Model) renderReview() string {
 		for i, p := range m.patches {
 			labels[i] = filepath.Base(p)
 		}
-	}
-	start := 0
-	if m.selected >= visible {
-		start = m.selected - visible + 1
-	}
-	if maxStart := len(labels) - visible; start > maxStart {
-		start = maxStart
-	}
-	if start < 0 {
-		start = 0
 	}
 	var list strings.Builder
 	for i := start; i < len(labels) && i < start+visible; i++ {
@@ -165,12 +159,53 @@ func (m Model) renderReview() string {
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 
-	hint := "↑/↓ select  e edit  r reprompt  a accept  q abort"
+	hint := "↑/↓ select  e edit  r reprompt  a accept  q abort  pgup/pgdn ctrl+u/d scroll"
 	if m.editing {
 		hint = "Ctrl+S save  Esc cancel"
+	} else if label := m.harnessLabel(); label != "" {
+		hint += "  |  harness: " + label
 	}
 	if m.reviewStatus != "" {
 		hint += "  |  " + m.reviewStatus
 	}
 	return panes + "\n" + renderStatusBar(cw, hint)
+}
+
+// reviewListStart returns the index of the first patch row shown in the review
+// list and how many rows are visible, using the same scroll math as
+// renderReview so clicks and rendering agree.
+func (m Model) reviewListStart() (start, visible int) {
+	_, ch := m.dims()
+	bodyH := ch - 1 // bottom status bar
+	if bodyH < 3 {
+		bodyH = 3
+	}
+	visible = bodyH - 3 // borders plus title row
+	if visible < 1 {
+		visible = 1
+	}
+	start = 0
+	if m.selected >= visible {
+		start = m.selected - visible + 1
+	}
+	if maxStart := len(m.patches) - visible; start > maxStart {
+		start = maxStart
+	}
+	if start < 0 {
+		start = 0
+	}
+	return start, visible
+}
+
+// harnessLabel returns "<name> <version>" for the active harness, or the name
+// alone when its version is unknown. It is empty when no harness is selected.
+func (m Model) harnessLabel() string {
+	if m.h == nil {
+		return ""
+	}
+	name := m.h.Name()
+	if v := m.harnessVersions[name]; v != "" {
+		return name + " " + v
+	}
+	return name
 }

@@ -50,9 +50,12 @@ type instructionResultMsg struct {
 }
 
 // harnessOutputMsg carries a single line of harness stdout/stderr streamed
-// live while a harness command runs.
+// live while a harness command runs. ch is the per-run channel the line came
+// from; Update re-arms that channel so a superseded run's late output cannot
+// resume draining a newer run's channel.
 type harnessOutputMsg struct {
 	line string
+	ch   chan tea.Msg
 }
 
 type Model struct {
@@ -67,11 +70,14 @@ type Model struct {
 	cfg  *config.Config
 	h    harness.Harness
 
-	available  []string
-	setupIdx   int
-	rangeInput textinput.Model
-	rangeSpec  string
-	rangeBase  string
+	available []string
+	// harnessVersions records each available harness's reported version so the
+	// setup list and status bars can name it without re-running --version.
+	harnessVersions map[string]string
+	setupIdx        int
+	rangeInput      textinput.Model
+	rangeSpec       string
+	rangeBase       string
 	// rangeErr holds a range validation failure so the range screen can show
 	// it inline and let the user correct the input instead of ending the flow.
 	rangeErr string
@@ -82,8 +88,11 @@ type Model struct {
 	pushBranch string
 	pushErr    string
 	// pushing is set while doPush is in flight so the confirm screen ignores
-	// repeated confirmations until the result arrives.
+	// repeated confirmations until the result arrives. pushCancel aborts the
+	// in-flight push (bounded by a 3-minute timeout) when the user presses
+	// Ctrl+C.
 	pushing     bool
+	pushCancel  context.CancelFunc
 	instrInput  textinput.Model
 	instruction string
 	// instructionStatus is shown while generating and on the instruction
@@ -148,6 +157,7 @@ func New(repo string) Model {
 	}
 	m.instrInput.Placeholder = "rewrite commit messages to be concise"
 	m.available = harness.Detect()
+	m.harnessVersions = harnessVersions(m.available)
 	m.resize()
 
 	// Reuse persisted selection when it is still available.
@@ -190,6 +200,16 @@ func New(repo string) Model {
 	return m
 }
 
+// harnessVersions maps each detected harness name to the version it reports,
+// so screens can name the active harness without re-running --version.
+func harnessVersions(names []string) map[string]string {
+	vs := make(map[string]string, len(names))
+	for _, name := range names {
+		vs[name] = harness.Version(name)
+	}
+	return vs
+}
+
 // prefillRange sets the range input to the repo's default range when the
 // input is still empty. When no default range can be derived (for example a
 // repository with fewer than two commits) the input is left empty and the
@@ -213,10 +233,13 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
 		if keyMsg.String() == "ctrl+c" {
-			// Ignore the quit while a push is in flight: the rewrite is
-			// already underway and its result must land.
+			// A push in flight is abortable: cancel it (the 3-minute timeout
+			// bounds it otherwise) and quit rather than waiting it out.
 			if m.pushing {
-				return m, nil
+				if m.pushCancel != nil {
+					m.pushCancel()
+				}
+				return m, tea.Quit
 			}
 			if m.runCancel != nil {
 				m.runCancel()
@@ -252,7 +275,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		switch {
-		case m.screen == scrRange && keyMsg.String() != "enter":
+		case m.screen == scrRange && keyMsg.String() != "enter" && keyMsg.String() != "ctrl+h":
 			var cmd tea.Cmd
 			m.rangeInput, cmd = m.rangeInput.Update(msg)
 			return m, cmd
@@ -276,6 +299,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.MouseWheelMsg:
 		return m.handleWheel(msg)
+	case tea.MouseClickMsg:
+		return m.handleClick(msg)
 	case harnessOutputMsg:
 		m.runOutput = append(m.runOutput, msg.line)
 		if len(m.runOutput) > maxRunOutputLines {
@@ -284,9 +309,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.outputViewport.SetContent(strings.Join(m.runOutput, "\n"))
 		m.outputViewport.GotoBottom()
 		// Keep draining on any screen so background output never blocks the
-		// harness process.
-		if m.runCh != nil {
-			return m, waitForRun(m.runCh)
+		// harness process. Re-arm the channel this line came from so output
+		// from a superseded run cannot resume draining a newer run's channel.
+		ch := msg.ch
+		if ch == nil {
+			ch = m.runCh
+		}
+		if ch != nil {
+			return m, waitForRun(ch)
 		}
 		return m, nil
 	case runResultMsg:
@@ -329,6 +359,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case pushResultMsg:
 		m.pushing = false
+		if m.pushCancel != nil {
+			m.pushCancel()
+			m.pushCancel = nil
+		}
 		if msg.err != nil {
 			m.finalErr = msg.err
 			m.finalMsg = msg.err.Error()
@@ -418,6 +452,27 @@ func (m Model) handleWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleClick selects the patch under a left-pane click on the review screen's
+// view mode. Every other click is a no-op.
+func (m Model) handleClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	if m.screen != scrReview || m.editing {
+		return m, nil
+	}
+	lw, _ := m.reviewPaneWidths()
+	if msg.X >= lw {
+		return m, nil
+	}
+	start, visible := m.reviewListStart()
+	// The list content starts two rows down (top border plus title row).
+	idx := start + msg.Y - 2
+	if idx < start || idx >= start+visible || idx >= len(m.patches) {
+		return m, nil
+	}
+	m.selected = idx
+	m.loadSelectedPatch()
+	return m, nil
+}
+
 func (m Model) handleKey(key string) (Model, tea.Cmd) {
 	switch m.screen {
 	case scrSetup:
@@ -460,6 +515,26 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.textarea.Blur()
 		}
 	case scrRange:
+		if key == "ctrl+h" {
+			// Reopen the harness picker, preselecting the active harness and
+			// refreshing what is currently installed.
+			m.available = harness.Detect()
+			m.harnessVersions = harnessVersions(m.available)
+			m.setupIdx = 0
+			if m.h != nil {
+				for i, name := range m.available {
+					if name == m.h.Name() {
+						m.setupIdx = i
+						break
+					}
+				}
+			}
+			m.rangeInput.Blur()
+			m.instrInput.Blur()
+			m.textarea.Blur()
+			m.screen = scrSetup
+			return m, nil
+		}
 		if key == "enter" {
 			m.rangeErr = ""
 			v := strings.TrimSpace(m.rangeInput.Value())
@@ -491,6 +566,9 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.rangeBase = base
+			// A fresh range restarts from the top of the flow; any reprompt
+			// intent from a prior review does not carry over.
+			m.reprompting = false
 			m.rangeInput.Blur()
 			m.instructionStatus = "generating instruction..."
 			m.screen = scrGenerate
@@ -532,7 +610,9 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.dontModify = !m.dontModify
 		case "esc":
 			// Back out to the range screen, keeping the typed instruction so
-			// it is still there if the user returns.
+			// it is still there if the user returns, and drop any reprompt
+			// intent so the flow restarts cleanly.
+			m.reprompting = false
 			m.instrInput.Blur()
 			m.rangeInput.Focus()
 			m.screen = scrRange
@@ -617,7 +697,10 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.pushing = true
-			return m, m.doPush()
+			// doPush stores its cancel func on the model, so capture it before
+			// returning the updated model.
+			cmd := m.doPush()
+			return m, cmd
 		case "n", "q", "esc":
 			m.cleanup()
 			m.finalMsg = "aborted before push"

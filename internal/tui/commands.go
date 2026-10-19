@@ -26,7 +26,7 @@ const maxRunOutputLines = 5000
 // harnessOutputMsg and every stderr line prefixed with "stderr: ". It returns
 // stdout and stderr separately so callers can distinguish harness output from
 // diagnostics. ch may be nil to suppress streaming.
-func streamCommand(ctx context.Context, bin string, args []string, dir string, ch chan<- tea.Msg) (stdout, stderr string, err error) {
+func streamCommand(ctx context.Context, bin string, args []string, dir string, ch chan tea.Msg) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir
 	outPipe, err := cmd.StdoutPipe()
@@ -59,7 +59,7 @@ func streamCommand(ctx context.Context, bin string, args []string, dir string, c
 			}
 			buf.WriteString(line)
 			if ch != nil {
-				ch <- harnessOutputMsg{line: prefix + line}
+				ch <- harnessOutputMsg{line: prefix + line, ch: ch}
 			}
 		}
 		if sc.Err() != nil {
@@ -308,7 +308,10 @@ func editPrompt(instruction string) string {
 }
 
 func (m *Model) doPush() tea.Cmd {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	m.pushCancel = cancel
 	return func() tea.Msg {
+		defer cancel()
 		repo := m.repo
 		patches := m.patches
 		if m.pushRemote == "" || m.pushBranch == "" {
@@ -353,7 +356,7 @@ func (m *Model) doPush() tea.Cmd {
 				return pushResultMsg{err: fmt.Errorf("final state modified:\ntree %s != %s; history restored to refs/gitforgery2/original", newTree, snap.Tree)}
 			}
 		}
-		if err := git.ForcePush(repo, m.pushRemote, m.pushBranch); err != nil {
+		if err := git.ForcePush(ctx, repo, m.pushRemote, m.pushBranch); err != nil {
 			_, _ = git.Run(repo, "reset", "--hard", "refs/gitforgery2/original")
 			return pushResultMsg{err: fmt.Errorf("%w; history restored to refs/gitforgery2/original", err)}
 		}

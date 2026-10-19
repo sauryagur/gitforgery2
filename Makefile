@@ -2,7 +2,10 @@
 SHELL := /bin/bash
 
 BINARY     := gitforgery
-MODULE     := $(shell go list -m)
+GOBIN      ?= $(shell go env GOBIN)
+ifeq ($(GOBIN),)
+GOBIN      := $(shell go env GOPATH)/bin
+endif
 GOFLAGS    := -trimpath
 LDFLAGS    := -s -w
 
@@ -18,7 +21,8 @@ build:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/$(BINARY) .
 
 install:
-	go install -ldflags '$(LDFLAGS)' $(MODULE)
+	@mkdir -p $(GOBIN)
+	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(GOBIN)/$(BINARY) .
 
 test:
 	go test ./...
@@ -57,7 +61,7 @@ clean:
 help:
 	@echo "Targets:"
 	@echo "  build       compile bin/$(BINARY) (default)"
-	@echo "  install      go install to GOBIN"
+	@echo "  install      build $(BINARY) into GOBIN"
 	@echo "  test         run tests"
 	@echo "  test-race   run tests with race detector"
 	@echo "  cover         run tests and print coverage"

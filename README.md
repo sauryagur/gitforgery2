@@ -19,7 +19,12 @@ The accepted spec is [RFC.md](RFC.md).
 ```sh
 make build
 ./bin/gitforgery [repo]   # repo defaults to the current directory
+
+make install              # installs the `gitforgery` binary into $(go env GOBIN)
 ```
+
+The binary is always named `gitforgery` (including in the release archives
+published by GoReleaser).
 
 Flow: select harness → confirm the commit range → review the generated
 instruction → run the harness → review/edit patches → accept → confirm

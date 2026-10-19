@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -48,6 +49,11 @@ func DefaultRange(repo string) (string, error) {
 		if err == nil && mb != "" && (tipErr != nil || mb != tip) {
 			return mb + "..HEAD", nil
 		}
+	}
+	// A repository without commits has no range to rewrite; report that
+	// clearly instead of a raw rev-parse failure.
+	if _, err := Run(repo, "rev-parse", "--verify", "HEAD"); err != nil {
+		return "", fmt.Errorf("repository has no commits yet")
 	}
 	// fallback: up to the last 5 commits, clamped to the repo's history so a
 	// short repo does not produce an invalid "HEAD~5" range.
@@ -154,9 +160,15 @@ func CreateBackupRef(repo string) error {
 	return err
 }
 
-func ForcePush(repo, remote, branch string) error {
-	_, err := Run(repo, "push", "--force", remote, "HEAD:"+branch)
-	return err
+func ForcePush(ctx context.Context, repo, remote, branch string) error {
+	args := []string{"push", "--force", remote, "HEAD:" + branch}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = repo
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, string(out))
+	}
+	return nil
 }
 
 func RemoteBranch(repo string) (string, string, error) {
