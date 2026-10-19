@@ -360,17 +360,24 @@ func TestCtrlCOnRunCancelsAndCleans(t *testing.T) {
 	}
 }
 
-// TestCtrlCIgnoredWhilePushing verifies that Ctrl+C cannot quit while a push
-// is in flight.
-func TestCtrlCIgnoredWhilePushing(t *testing.T) {
+// TestCtrlCWhilePushingCancels verifies that Ctrl+C during a push cancels the
+// in-flight push (bounded by the doPush timeout) and quits instead of being
+// ignored.
+func TestCtrlCWhilePushingCancels(t *testing.T) {
 	m := testModel()
 	m.pushing = true
-	nm, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
-	if cmd != nil {
-		t.Fatal("ctrl+c returned a command while pushing")
+	cancelled := false
+	m.pushCancel = func() { cancelled = true }
+
+	_, cmd := m.Update(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
+	if !cancelled {
+		t.Fatal("ctrl+c while pushing did not cancel the push")
 	}
-	if got := nm.(Model); !got.pushing {
-		t.Fatal("ctrl+c cleared the in-flight push flag")
+	if cmd == nil {
+		t.Fatal("ctrl+c while pushing did not return a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("ctrl+c while pushing did not return a quit command")
 	}
 }
 
@@ -473,5 +480,75 @@ func TestEscBacksOutOfInstruction(t *testing.T) {
 	}
 	if !got.rangeInput.Focused() {
 		t.Fatal("range input not focused after esc")
+	}
+}
+
+// TestRepromptResetOnEsc verifies that backing out of the instruction screen
+// clears the reprompt intent so a later run does not reuse the old patch dir.
+func TestRepromptResetOnEsc(t *testing.T) {
+	m := testModel()
+	m.screen = scrReview
+	m.instruction = "make it concise"
+	m.instrInput.SetValue("make it concise")
+
+	nm, _ := m.Update(tea.KeyPressMsg{Text: "r", Code: 'r'})
+	got := nm.(Model)
+	if !got.reprompting {
+		t.Fatal("r on the review screen did not set reprompting")
+	}
+	if got.screen != scrInstruction {
+		t.Fatalf("screen = %d, want scrInstruction", got.screen)
+	}
+
+	nm2, _ := got.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	final := nm2.(Model)
+	if final.reprompting {
+		t.Fatal("esc on the instruction screen left reprompting set")
+	}
+	if final.screen != scrRange {
+		t.Fatalf("screen = %d, want scrRange", final.screen)
+	}
+}
+
+// TestHarnessOutputRearmsOwnChannel verifies that a streamed line re-arms the
+// channel it arrived on, so a stale run cannot resume draining a newer one.
+func TestHarnessOutputRearmsOwnChannel(t *testing.T) {
+	m := testModel()
+	ch := make(chan tea.Msg, 1)
+
+	nm, cmd := m.Update(harnessOutputMsg{line: "hello", ch: ch})
+	if cmd == nil {
+		t.Fatal("harnessOutputMsg carrying a channel did not re-arm a command")
+	}
+	got := nm.(Model)
+	if len(got.runOutput) == 0 || got.runOutput[len(got.runOutput)-1] != "hello" {
+		t.Fatalf("harness output not appended: %v", got.runOutput)
+	}
+
+	close(ch)
+	if msg := cmd(); msg != nil {
+		t.Fatalf("re-arm command returned %v after the channel closed, want nil", msg)
+	}
+}
+
+// TestMouseClickSelectsPatch verifies that clicking the second row of the left
+// pane selects the second patch.
+func TestMouseClickSelectsPatch(t *testing.T) {
+	patches, names := realPatches(t)
+	m := testModel()
+	m.screen = scrReview
+	m.width, m.height = 120, 40
+	m.patches = patches
+	m.patchNames = names
+	m.resize()
+
+	lw, _ := m.reviewPaneWidths()
+	nm, cmd := m.Update(tea.MouseClickMsg{X: lw / 2, Y: 3, Button: tea.MouseLeft})
+	if cmd != nil {
+		t.Fatal("mouse click returned a command")
+	}
+	got := nm.(Model)
+	if got.selected != 1 {
+		t.Fatalf("selected = %d, want 1 after clicking the second row", got.selected)
 	}
 }

@@ -1,11 +1,13 @@
 package git
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func gitRun(t *testing.T, dir string, args ...string) {
@@ -294,5 +296,59 @@ func TestCleanWorktree(t *testing.T) {
 	}
 	if err := CleanWorktree(repo); err == nil {
 		t.Fatal("CleanWorktree with modified tracked file succeeded, want error")
+	}
+}
+
+func TestDefaultRangeEmptyRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	gitRun(t, repo, "init")
+
+	got, err := DefaultRange(repo)
+	if err == nil {
+		t.Fatalf("DefaultRange on empty repo = %q, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("DefaultRange on empty repo returned %q with error, want empty", got)
+	}
+	if !strings.Contains(err.Error(), "no commits") {
+		t.Fatalf("DefaultRange error = %v, want mention of no commits", err)
+	}
+}
+
+func TestForcePushContext(t *testing.T) {
+	repo := newTestRepo(t)
+	bare := t.TempDir()
+	gitRun(t, repo, "init", "--bare", "-q", bare)
+	gitRun(t, repo, "remote", "add", "origin", bare)
+	gitRun(t, repo, "push", "-q", "-u", "origin", "HEAD")
+
+	branch := "rewritten"
+	if err := ForcePush(context.Background(), repo, "origin", branch); err != nil {
+		t.Fatalf("ForcePush with live context: %v", err)
+	}
+	tip, err := CurrentTip(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteTip, err := Run(bare, "rev-parse", "refs/heads/"+branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remoteTip != tip {
+		t.Fatalf("remote %s = %s, want %s", branch, remoteTip, tip)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err = ForcePush(ctx, repo, "origin", "cancelled")
+	if err == nil {
+		t.Fatal("ForcePush with cancelled context succeeded, want error")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("ForcePush with cancelled context took %v, want prompt failure", elapsed)
 	}
 }
