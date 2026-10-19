@@ -159,6 +159,8 @@ func TestParseRange(t *testing.T) {
 		{"both empty", ".."},
 		{"nonexistent base", "no-such-rev..HEAD"},
 		{"nonexistent end", "HEAD..no-such-rev"},
+		{"empty range", "HEAD..HEAD"},
+		{"empty range via aliases", "HEAD..HEAD^{commit}"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -170,6 +172,106 @@ func TestParseRange(t *testing.T) {
 
 	if _, err := RangeBase(repo, "HEAD~1..HEAD"); err != nil {
 		t.Fatalf("RangeBase: %v", err)
+	}
+}
+
+func TestParseRangeRejectsMerges(t *testing.T) {
+	repo := newTestRepo(t)
+
+	gitRun(t, repo, "checkout", "-b", "side")
+	if err := os.WriteFile(filepath.Join(repo, "side.txt"), []byte("side\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "side.txt")
+	gitRun(t, repo, "commit", "-m", "side commit")
+
+	gitRun(t, repo, "checkout", "-")
+	if err := os.WriteFile(filepath.Join(repo, "main.txt"), []byte("main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "main.txt")
+	gitRun(t, repo, "commit", "-m", "main commit")
+	gitRun(t, repo, "merge", "--no-ff", "side", "-m", "merge side")
+
+	// HEAD~1..HEAD contains only the merge commit itself.
+	if _, _, err := ParseRange(repo, "HEAD~1..HEAD"); err == nil {
+		t.Fatal("ParseRange on a merge range succeeded, want error")
+	} else if !strings.Contains(err.Error(), "merge") {
+		t.Fatalf("ParseRange merge error = %v, want mention of merge commits", err)
+	}
+
+	// A linear range ending before the merge is still accepted.
+	if _, _, err := ParseRange(repo, "HEAD~3..HEAD~1"); err != nil {
+		t.Fatalf("ParseRange on linear range: %v", err)
+	}
+}
+
+func TestCreateBackupRefWriteOnce(t *testing.T) {
+	repo := newTestRepo(t)
+	tip, err := CurrentTip(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := CreateBackupRef(repo); err != nil {
+		t.Fatalf("first CreateBackupRef: %v", err)
+	}
+	got, err := Run(repo, "rev-parse", "refs/gitforgery2/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != tip {
+		t.Fatalf("backup ref = %s, want %s", got, tip)
+	}
+
+	// Same tip: no-op.
+	if err := CreateBackupRef(repo); err != nil {
+		t.Fatalf("CreateBackupRef on same tip: %v", err)
+	}
+
+	// New commit: refuse to overwrite the original backup.
+	if err := os.WriteFile(filepath.Join(repo, "c.txt"), []byte("third\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "c.txt")
+	gitRun(t, repo, "commit", "-m", "third")
+	if err := CreateBackupRef(repo); err == nil {
+		t.Fatal("CreateBackupRef after new commit succeeded, want error")
+	} else if !strings.Contains(err.Error(), tip) {
+		t.Fatalf("CreateBackupRef error = %v, want mention of original tip %s", err, tip)
+	}
+	got, err = Run(repo, "rev-parse", "refs/gitforgery2/original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != tip {
+		t.Fatalf("backup ref changed to %s after refusal, want %s", got, tip)
+	}
+}
+
+func TestDefaultRangeSingleCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	repo := t.TempDir()
+	gitRun(t, repo, "init")
+	gitRun(t, repo, "config", "user.email", "test@example.com")
+	gitRun(t, repo, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, repo, "add", "a.txt")
+	gitRun(t, repo, "commit", "-m", "first")
+
+	got, err := DefaultRange(repo)
+	if err == nil {
+		t.Fatalf("DefaultRange on 1-commit repo = %q, want error", got)
+	}
+	if got != "" {
+		t.Fatalf("DefaultRange on 1-commit repo returned %q with error, want empty", got)
+	}
+	if !strings.Contains(err.Error(), "at least 2 commits") {
+		t.Fatalf("DefaultRange error = %v, want mention of 2 commits", err)
 	}
 }
 

@@ -72,6 +72,9 @@ type Model struct {
 	rangeInput textinput.Model
 	rangeSpec  string
 	rangeBase  string
+	// rangeErr holds a range validation failure so the range screen can show
+	// it inline and let the user correct the input instead of ending the flow.
+	rangeErr string
 	// pushRemote/pushBranch name the upstream resolved on the review screen;
 	// pushErr records why it could not be resolved so the confirm screen can
 	// refuse to push instead of dying mid-rewrite.
@@ -188,14 +191,19 @@ func New(repo string) Model {
 }
 
 // prefillRange sets the range input to the repo's default range when the
-// input is still empty (errors are ignored).
+// input is still empty. When no default range can be derived (for example a
+// repository with fewer than two commits) the input is left empty and the
+// reason is reported on the range screen.
 func (m *Model) prefillRange() {
 	if strings.TrimSpace(m.rangeInput.Value()) != "" {
 		return
 	}
-	if r, err := git.DefaultRange(m.repo); err == nil {
-		m.rangeInput.SetValue(r)
+	r, err := git.DefaultRange(m.repo)
+	if err != nil {
+		m.rangeErr = err.Error()
+		return
 	}
+	m.rangeInput.SetValue(r)
 }
 
 func (m Model) Init() tea.Cmd {
@@ -205,6 +213,20 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
 		if keyMsg.String() == "ctrl+c" {
+			// Ignore the quit while a push is in flight: the rewrite is
+			// already underway and its result must land.
+			if m.pushing {
+				return m, nil
+			}
+			if m.runCancel != nil {
+				m.runCancel()
+				m.runCancel = nil
+			}
+			// A run/generate abort leaves a patch directory behind and no
+			// screen to clean it up from, so remove it before quitting.
+			if m.screen == scrRun || m.screen == scrGenerate {
+				m.cleanup()
+			}
 			return m, tea.Quit
 		}
 		// Ignore input while a push is in flight so the confirm (or any other
@@ -234,7 +256,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.rangeInput, cmd = m.rangeInput.Update(msg)
 			return m, cmd
-		case m.screen == scrInstruction && keyMsg.String() != "enter" && keyMsg.String() != "tab":
+		case m.screen == scrInstruction && keyMsg.String() != "enter" && keyMsg.String() != "tab" && keyMsg.String() != "esc":
 			var cmd tea.Cmd
 			m.instrInput, cmd = m.instrInput.Update(msg)
 			return m, cmd
@@ -439,30 +461,33 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 		}
 	case scrRange:
 		if key == "enter" {
+			m.rangeErr = ""
 			v := strings.TrimSpace(m.rangeInput.Value())
 			if v == "" {
-				v, _ = git.DefaultRange(m.repo)
+				r, err := git.DefaultRange(m.repo)
+				if err != nil {
+					m.rangeErr = err.Error()
+					m.rangeInput.Focus()
+					return m, nil
+				}
+				v = r
 			}
 			m.rangeSpec = v
 			base, end, err := git.ParseRange(m.repo, v)
 			if err != nil {
-				m.finalErr = err
-				m.finalMsg = err.Error()
-				m.screen = scrDone
+				m.rangeErr = err.Error()
+				m.rangeInput.Focus()
 				return m, nil
 			}
 			head, err := git.CurrentTip(m.repo)
 			if err != nil {
-				m.finalErr = err
-				m.finalMsg = err.Error()
-				m.screen = scrDone
+				m.rangeErr = err.Error()
+				m.rangeInput.Focus()
 				return m, nil
 			}
 			if end != head {
-				err := fmt.Errorf("range must end at HEAD")
-				m.finalErr = err
-				m.finalMsg = err.Error()
-				m.screen = scrDone
+				m.rangeErr = fmt.Sprintf("range must end at HEAD: range ends at %s, HEAD is %s", end, head)
+				m.rangeInput.Focus()
 				return m, nil
 			}
 			m.rangeBase = base
@@ -505,6 +530,12 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 		switch key {
 		case "tab":
 			m.dontModify = !m.dontModify
+		case "esc":
+			// Back out to the range screen, keeping the typed instruction so
+			// it is still there if the user returns.
+			m.instrInput.Blur()
+			m.rangeInput.Focus()
+			m.screen = scrRange
 		case "enter":
 			m.instrInput.Blur()
 			m.instructionStatus = ""

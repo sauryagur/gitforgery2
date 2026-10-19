@@ -77,7 +77,11 @@ func (m *Model) resize() {
 	}
 	m.outputViewport.SetWidth(ow)
 	m.outputViewport.SetHeight(oh)
-	m.refreshPatchView()
+	// While the user is editing a patch a resize must only reflow the widgets;
+	// reloading the patch would discard the unsaved edits.
+	if !m.editing {
+		m.refreshPatchView()
+	}
 }
 
 // dims returns the terminal size, falling back to 80x24 when unset so that

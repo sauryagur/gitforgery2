@@ -216,6 +216,11 @@ func startRunResult(m Model, ctx context.Context, ch chan tea.Msg) runResultMsg 
 	if err != nil {
 		return runResultMsg{err: err}
 	}
+	if len(patches) == 0 {
+		// An empty patch set means the range produced nothing to rewrite;
+		// abort before spawning the harness with no input.
+		return runResultMsg{patchDir: tmp, err: fmt.Errorf("range produced no patches")}
+	}
 	m.patches = patches
 	bin, args := m.h.Command(editPrompt(m.instruction))
 	_, stderr, err := streamCommand(ctx, bin, args, tmp, ch)
