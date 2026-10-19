@@ -55,10 +55,18 @@ func (m Model) viewContent() string {
 		var b strings.Builder
 		b.WriteString("Force-push the rewritten history?")
 		_, _ = fmt.Fprintf(&b, "\n\n%d patch(es) will be applied", len(m.patches))
-		return m.renderForm("Confirm force-push", b.String(), "y/n")
+		hint := "y/n"
+		switch {
+		case m.pushErr != "":
+			_, _ = fmt.Fprintf(&b, "\n\ntarget unavailable: %s", m.pushErr)
+			hint = "n/q abort"
+		case m.pushRemote != "" || m.pushBranch != "":
+			_, _ = fmt.Fprintf(&b, "\n\ntarget: %s/%s", m.pushRemote, m.pushBranch)
+		}
+		return m.renderForm("Confirm force-push", b.String(), hint)
 	case scrDone:
 		if m.finalErr != nil {
-			return m.renderForm("Error", errorStyle.Render(m.finalErr.Error()), "Enter/q exit")
+			return m.renderForm("Error", errorStyle.Render(m.finalMsg), "Enter/q exit")
 		}
 		return m.renderForm("Done", successStyle.Render(m.finalMsg), "Enter/q exit")
 	}

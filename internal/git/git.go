@@ -39,11 +39,13 @@ func TreeOf(repo, ref string) (string, error) {
 }
 
 func DefaultRange(repo string) (string, error) {
-	// try upstream merge-base
+	// Use the upstream merge-base only when HEAD is actually ahead of it;
+	// otherwise a synced branch yields an empty "HEAD..HEAD" range.
+	tip, tipErr := CurrentTip(repo)
 	up, err := Run(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
 	if err == nil && up != "" {
 		mb, err := Run(repo, "merge-base", "HEAD", up)
-		if err == nil && mb != "" {
+		if err == nil && mb != "" && (tipErr != nil || mb != tip) {
 			return mb + "..HEAD", nil
 		}
 	}
@@ -195,15 +197,58 @@ func ResultingTree(repo, base string, patches []string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func RangeBase(repo, rangeSpec string) (string, error) {
-	parts := strings.SplitN(rangeSpec, "..", 2)
-	base := strings.TrimSpace(parts[0])
-	if base == "" {
-		return "", fmt.Errorf("invalid range: %s", rangeSpec)
-	}
-	out, err := Run(repo, "rev-parse", base+"^{commit}")
+// CleanWorktree reports an error when tracked files have uncommitted changes.
+// Untracked files alone do not block a rewrite, so they are ignored.
+func CleanWorktree(repo string) error {
+	out, err := Run(repo, "status", "--porcelain", "--untracked-files=no")
 	if err != nil {
-		out, err = Run(repo, "rev-parse", base)
+		return err
 	}
-	return out, err
+	if strings.TrimSpace(out) != "" {
+		return fmt.Errorf("working tree has uncommitted changes; commit or stash them before rewriting")
+	}
+	return nil
+}
+
+// ParseRange validates an A..B commit range and returns the commit OIDs for
+// both endpoints. Three-dot ranges are rejected because this tool only
+// rewrites a linear series with a definite base.
+func ParseRange(repo, spec string) (base, end string, err error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return "", "", fmt.Errorf("empty range")
+	}
+	if strings.Contains(spec, "...") {
+		return "", "", fmt.Errorf("three-dot ranges are not supported; use A..B instead of %q", spec)
+	}
+	parts := strings.SplitN(spec, "..", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid range %q: expected A..B", spec)
+	}
+	base = strings.TrimSpace(parts[0])
+	end = strings.TrimSpace(parts[1])
+	if base == "" || end == "" {
+		return "", "", fmt.Errorf("invalid range %q: both endpoints must be non-empty", spec)
+	}
+	verify := func(name, rev string) (string, error) {
+		out, err := Run(repo, "rev-parse", "--verify", rev+"^{commit}")
+		if err != nil {
+			return "", fmt.Errorf("invalid range %q: %s endpoint %q: %w", spec, name, rev, err)
+		}
+		return out, nil
+	}
+	base, err = verify("base", base)
+	if err != nil {
+		return "", "", err
+	}
+	end, err = verify("end", end)
+	if err != nil {
+		return "", "", err
+	}
+	return base, end, nil
+}
+
+func RangeBase(repo, rangeSpec string) (string, error) {
+	base, _, err := ParseRange(repo, rangeSpec)
+	return base, err
 }

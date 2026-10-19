@@ -153,18 +153,29 @@ func (m *Model) startRun() tea.Cmd {
 // runs the harness in the patch directory; m is a snapshot of the Model.
 func startRunResult(m Model, ch chan tea.Msg) runResultMsg {
 	repo := m.repo
-	if err := git.CreateBackupRef(repo); err != nil {
+	if err := git.CleanWorktree(repo); err != nil {
 		return runResultMsg{err: err}
 	}
-	tip, err := git.CurrentTip(repo)
+	base, end, err := git.ParseRange(repo, m.rangeSpec)
 	if err != nil {
+		return runResultMsg{err: err}
+	}
+	head, err := git.CurrentTip(repo)
+	if err != nil {
+		return runResultMsg{err: err}
+	}
+	if end != head {
+		return runResultMsg{err: fmt.Errorf("range must end at HEAD")}
+	}
+	m.rangeBase = base
+	if err := git.CreateBackupRef(repo); err != nil {
 		return runResultMsg{err: err}
 	}
 	tree, err := git.TreeOf(repo, "HEAD")
 	if err != nil {
 		return runResultMsg{err: err}
 	}
-	if err := snapshot.Save(repo, snapshot.Snapshot{Tip: tip, Tree: tree}); err != nil {
+	if err := snapshot.Save(repo, snapshot.Snapshot{Tip: head, Tree: tree}); err != nil {
 		return runResultMsg{err: err}
 	}
 
@@ -264,6 +275,12 @@ func (m *Model) doPush() tea.Cmd {
 	return func() tea.Msg {
 		repo := m.repo
 		patches := m.patches
+		if m.pushRemote == "" || m.pushBranch == "" {
+			return pushResultMsg{err: fmt.Errorf("push target is not resolved; return to review and press a again")}
+		}
+		if err := git.CleanWorktree(repo); err != nil {
+			return pushResultMsg{err: err}
+		}
 		if m.dontModify {
 			snap, err := snapshot.Load(repo)
 			if err != nil {
@@ -282,35 +299,29 @@ func (m *Model) doPush() tea.Cmd {
 		if err := git.Am(repo, patches); err != nil {
 			_, _ = git.Run(repo, "am", "--abort")
 			_, _ = git.Run(repo, "reset", "--hard", "refs/gitforgery2/original")
-			m.cleanup()
-			return pushResultMsg{err: err}
+			return pushResultMsg{err: fmt.Errorf("%w; history restored to refs/gitforgery2/original", err)}
 		}
 		if m.dontModify {
 			snap, err := snapshot.Load(repo)
 			if err != nil {
 				_, _ = git.Run(repo, "reset", "--hard", "refs/gitforgery2/original")
-				return pushResultMsg{err: fmt.Errorf("final state check failed: %w", err)}
+				return pushResultMsg{err: fmt.Errorf("final state check failed: %w; history restored to refs/gitforgery2/original", err)}
 			}
 			newTree, err := git.TreeOf(repo, "HEAD")
 			if err != nil {
 				_, _ = git.Run(repo, "reset", "--hard", "refs/gitforgery2/original")
-				return pushResultMsg{err: err}
+				return pushResultMsg{err: fmt.Errorf("%w; history restored to refs/gitforgery2/original", err)}
 			}
 			if newTree != snap.Tree {
 				_, _ = git.Run(repo, "reset", "--hard", "refs/gitforgery2/original")
-				return pushResultMsg{err: fmt.Errorf("final state modified:\ntree %s != %s", newTree, snap.Tree)}
+				return pushResultMsg{err: fmt.Errorf("final state modified:\ntree %s != %s; history restored to refs/gitforgery2/original", newTree, snap.Tree)}
 			}
 		}
-		remote, branch, err := git.RemoteBranch(repo)
-		if err != nil {
-			m.cleanup()
-			return pushResultMsg{err: err}
-		}
-		if err := git.ForcePush(repo, remote, branch); err != nil {
-			m.cleanup()
-			return pushResultMsg{err: err}
+		if err := git.ForcePush(repo, m.pushRemote, m.pushBranch); err != nil {
+			_, _ = git.Run(repo, "reset", "--hard", "refs/gitforgery2/original")
+			return pushResultMsg{err: fmt.Errorf("%w; history restored to refs/gitforgery2/original", err)}
 		}
 		m.cleanup()
-		return pushResultMsg{msg: "pushed " + remote + "/" + branch}
+		return pushResultMsg{msg: "pushed " + m.pushRemote + "/" + m.pushBranch}
 	}
 }

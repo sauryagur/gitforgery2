@@ -66,11 +66,17 @@ type Model struct {
 	cfg  *config.Config
 	h    harness.Harness
 
-	available   []string
-	setupIdx    int
-	rangeInput  textinput.Model
-	rangeSpec   string
-	rangeBase   string
+	available  []string
+	setupIdx   int
+	rangeInput textinput.Model
+	rangeSpec  string
+	rangeBase  string
+	// pushRemote/pushBranch name the upstream resolved on the review screen;
+	// pushErr records why it could not be resolved so the confirm screen can
+	// refuse to push instead of dying mid-rewrite.
+	pushRemote  string
+	pushBranch  string
+	pushErr     string
 	instrInput  textinput.Model
 	instruction string
 	// instructionStatus is shown while generating and on the instruction
@@ -258,6 +264,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.runStatus = "error: " + msg.err.Error()
 			m.finalErr = msg.err
 			m.finalMsg = msg.err.Error()
+			if m.patchDir != "" {
+				m.finalMsg += "\npatch dir: " + m.patchDir
+			}
 			m.screen = scrDone
 			return m, nil
 		}
@@ -265,6 +274,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.originalTree = msg.tree
 		}
 		m.runStatus = "done"
+		m.pushErr = ""
+		m.pushRemote = ""
+		m.pushBranch = ""
 		m.screen = scrReview
 		m.selected = 0
 		m.patchNames = patchLabels(m.patches)
@@ -276,6 +288,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.finalErr = msg.err
 			m.finalMsg = msg.err.Error()
+			if m.patchDir != "" {
+				m.finalMsg += "\npatch dir: " + m.patchDir
+			}
 		} else {
 			m.finalMsg = msg.msg
 		}
@@ -406,14 +421,28 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				v, _ = git.DefaultRange(m.repo)
 			}
 			m.rangeSpec = v
-			b, err := git.RangeBase(m.repo, v)
+			base, end, err := git.ParseRange(m.repo, v)
 			if err != nil {
 				m.finalErr = err
 				m.finalMsg = err.Error()
 				m.screen = scrDone
 				return m, nil
 			}
-			m.rangeBase = b
+			head, err := git.CurrentTip(m.repo)
+			if err != nil {
+				m.finalErr = err
+				m.finalMsg = err.Error()
+				m.screen = scrDone
+				return m, nil
+			}
+			if end != head {
+				err := fmt.Errorf("range must end at HEAD")
+				m.finalErr = err
+				m.finalMsg = err.Error()
+				m.screen = scrDone
+				return m, nil
+			}
+			m.rangeBase = base
 			m.rangeInput.Blur()
 			m.instructionStatus = "generating instruction..."
 			m.screen = scrGenerate
@@ -497,6 +526,14 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.screen = scrInstruction
 			m.instrInput.Focus()
 		case "a", "enter":
+			m.pushErr = ""
+			remote, branch, err := git.RemoteBranch(m.repo)
+			if err != nil {
+				m.pushErr = err.Error()
+			} else {
+				m.pushRemote = remote
+				m.pushBranch = branch
+			}
 			m.screen = scrConfirm
 		case "q", "esc":
 			m.cleanup()
@@ -506,6 +543,9 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 	case scrConfirm:
 		switch key {
 		case "y", "enter":
+			if m.pushErr != "" {
+				return m, nil
+			}
 			return m, m.doPush()
 		case "n", "q", "esc":
 			m.cleanup()
