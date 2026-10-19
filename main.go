@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/sauryagur/gitforgery2/internal/gitx"
+	"github.com/sauryagur/gitforgery2/internal/git"
 	"github.com/sauryagur/gitforgery2/internal/tui"
 )
 
@@ -13,7 +13,7 @@ func main() {
 	if len(os.Args) > 1 {
 		repo = os.Args[1]
 	}
-	root, err := gitx.RepoRoot(repo)
+	root, err := git.RepoRoot(repo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "not a git repo:", err)
 		os.Exit(1)

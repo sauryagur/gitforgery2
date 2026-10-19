@@ -1,4 +1,4 @@
-package gitx
+package git
 
 import (
 	"fmt"
@@ -86,13 +86,27 @@ func PatchFiles(dir string) ([]string, error) {
 	return files, nil
 }
 
-func ApplyCheck(repo string, patches []string) error {
-	if len(patches) == 0 {
-		return nil
+// tempIndex creates a temporary index seeded from base and returns its
+// GIT_INDEX_FILE environment plus a cleanup func.
+func tempIndex(repo, base string) ([]string, func(), error) {
+	f, err := os.CreateTemp("", "gitforgery2-index-*")
+	if err != nil {
+		return nil, nil, err
 	}
-	args := append([]string{"apply", "--check"}, patches...)
-	_, err := Run(repo, args...)
-	return err
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return nil, nil, err
+	}
+	env := append(os.Environ(), "GIT_INDEX_FILE="+name)
+	read := exec.Command("git", "read-tree", base)
+	read.Dir = repo
+	read.Env = env
+	if out, err := read.CombinedOutput(); err != nil {
+		_ = os.Remove(name)
+		return nil, nil, fmt.Errorf("read-tree: %w\n%s", err, string(out))
+	}
+	return env, func() { _ = os.Remove(name) }, nil
 }
 
 func Am(repo string, patches []string) error {
@@ -136,6 +150,10 @@ func DiffStat(repo, oldTree, newTree string) (string, error) {
 	return Run(repo, "diff", "--stat", oldTree, newTree)
 }
 
+// ResultingTree applies patches to a temporary index seeded from base and
+// returns the resulting tree OID. The apply both validates the series and
+// yields the tree used by the RFC §5 final-state check; `git apply --check`
+// cannot validate a sequential format-patch series in one invocation.
 func ResultingTree(repo, base string, patches []string) (string, error) {
 	if base == "" {
 		base = "HEAD"
@@ -144,21 +162,11 @@ func ResultingTree(repo, base string, patches []string) (string, error) {
 		tree, err := TreeOf(repo, base)
 		return tree, err
 	}
-	tmpIndex, err := os.CreateTemp("", "gitforgery2-index-*")
+	env, cleanup, err := tempIndex(repo, base)
 	if err != nil {
 		return "", err
 	}
-	if err := tmpIndex.Close(); err != nil {
-		return "", err
-	}
-	defer func() { _ = os.Remove(tmpIndex.Name()) }()
-	env := append(os.Environ(), "GIT_INDEX_FILE="+tmpIndex.Name())
-	read := exec.Command("git", "read-tree", base)
-	read.Dir = repo
-	read.Env = env
-	if out, err := read.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("read-tree: %w\n%s", err, string(out))
-	}
+	defer cleanup()
 	applyArgs := append([]string{"apply", "--cached"}, patches...)
 	apply := exec.Command("git", applyArgs...)
 	apply.Dir = repo

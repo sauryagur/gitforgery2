@@ -13,7 +13,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 
-	"github.com/sauryagur/gitforgery2/internal/gitx"
+	"github.com/sauryagur/gitforgery2/internal/git"
 )
 
 // testModel builds a Model with real widgets but without touching config or
@@ -52,10 +52,10 @@ func realPatches(t *testing.T) ([]string, []string) {
 		run("commit", "-q", "-m", msg)
 	}
 	patchDir := t.TempDir()
-	if err := gitx.FormatPatch(repo, "HEAD~2..HEAD", patchDir); err != nil {
+	if err := git.FormatPatch(repo, "HEAD~2..HEAD", patchDir); err != nil {
 		t.Fatal(err)
 	}
-	patches, err := gitx.PatchFiles(patchDir)
+	patches, err := git.PatchFiles(patchDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,21 +157,21 @@ func TestCheckFinalStateMismatch(t *testing.T) {
 	run("add", "f.txt")
 	run("commit", "-q", "-m", "second")
 
-	base, err := gitx.RangeBase(repo, "HEAD~1..HEAD")
+	base, err := git.RangeBase(repo, "HEAD~1..HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
 	patchDir := t.TempDir()
-	if err := gitx.FormatPatch(repo, "HEAD~1..HEAD", patchDir); err != nil {
+	if err := git.FormatPatch(repo, "HEAD~1..HEAD", patchDir); err != nil {
 		t.Fatal(err)
 	}
-	patches, err := gitx.PatchFiles(patchDir)
+	patches, err := git.PatchFiles(patchDir)
 	if err != nil || len(patches) == 0 {
 		t.Fatalf("no patches: %v", err)
 	}
 
 	// The base tree differs from the tree resulting from applying the patches.
-	wrong, err := gitx.TreeOf(repo, base)
+	wrong, err := git.TreeOf(repo, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,5 +183,34 @@ func TestCheckFinalStateMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "final state modified") {
 		t.Fatalf("error %q does not mention %q", err.Error(), "final state modified")
+	}
+}
+
+// TestWheelMovesReviewSelection checks that the wheel scrolls the patch list
+// when over the left pane and leaves the selection alone over the diff pane.
+func TestWheelMovesReviewSelection(t *testing.T) {
+	patches, names := realPatches(t)
+	m := testModel()
+	m.screen = scrReview
+	m.width, m.height = 120, 40
+	m.patches = patches
+	m.patchNames = names
+	m.resize()
+
+	lw, _ := m.reviewPaneWidths()
+	te, _ := m.Update(tea.MouseWheelMsg{X: lw / 2, Y: 5, Button: tea.MouseWheelDown})
+	m = te.(Model)
+	if m.selected != 1 {
+		t.Fatalf("selected = %d, want 1 after wheel down in list", m.selected)
+	}
+	te, _ = m.Update(tea.MouseWheelMsg{X: lw / 2, Y: 5, Button: tea.MouseWheelUp})
+	m = te.(Model)
+	if m.selected != 0 {
+		t.Fatalf("selected = %d, want 0 after wheel up in list", m.selected)
+	}
+	te, _ = m.Update(tea.MouseWheelMsg{X: lw + 1, Y: 5, Button: tea.MouseWheelDown})
+	m = te.(Model)
+	if m.selected != 0 {
+		t.Fatalf("selected = %d, want 0 after wheel over the diff pane", m.selected)
 	}
 }

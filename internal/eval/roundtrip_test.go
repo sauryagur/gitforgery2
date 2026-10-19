@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sauryagur/gitforgery2/internal/gitx"
+	"github.com/sauryagur/gitforgery2/internal/git"
 )
 
 func TestFormatPatchRoundTrip(t *testing.T) {
@@ -32,23 +32,23 @@ func TestFormatPatchRoundTrip(t *testing.T) {
 	run("add", "f.txt")
 	run("commit", "-q", "-m", "second")
 
-	treeBefore, _ := gitx.TreeOf(repo, "HEAD")
+	treeBefore, _ := git.TreeOf(repo, "HEAD")
 
 	patchDir := t.TempDir()
-	if err := gitx.FormatPatch(repo, "HEAD~1..HEAD", patchDir); err != nil {
+	if err := git.FormatPatch(repo, "HEAD~1..HEAD", patchDir); err != nil {
 		t.Fatal(err)
 	}
-	patches, err := gitx.PatchFiles(patchDir)
+	patches, err := git.PatchFiles(patchDir)
 	if err != nil || len(patches) == 0 {
 		t.Fatalf("no patches: %v", err)
 	}
 
 	// reset repo to before and re-apply patches
 	run("reset", "--hard", "HEAD~1")
-	if err := gitx.Am(repo, patches); err != nil {
+	if err := git.Am(repo, patches); err != nil {
 		t.Fatal(err)
 	}
-	treeAfter, _ := gitx.TreeOf(repo, "HEAD")
+	treeAfter, _ := git.TreeOf(repo, "HEAD")
 	if treeAfter != treeBefore {
 		t.Fatalf("tree changed: %s != %s", treeAfter, treeBefore)
 	}

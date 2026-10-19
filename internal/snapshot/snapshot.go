@@ -6,11 +6,11 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/sauryagur/gitforgery2/internal/gitx"
+	"github.com/sauryagur/gitforgery2/internal/git"
 )
 
 func dir(repo string) string {
-	gd, err := gitx.GitDir(repo)
+	gd, err := git.GitDir(repo)
 	if err != nil || gd == "" {
 		gd = filepath.Join(repo, ".git")
 	}
