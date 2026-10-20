@@ -688,6 +688,9 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				return m, nil
 			}
 			m.rangeBase = base
+			if stats, err := git.CollectSessionStats(m.repo, base, end); err == nil {
+				m.session = stats
+			}
 			// A fresh range restarts from the top of the flow; any reprompt
 			// intent from a prior review does not carry over.
 			m.reprompting = false
