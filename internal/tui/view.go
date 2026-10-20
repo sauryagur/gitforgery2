@@ -1,10 +1,6 @@
 package tui
 
 import (
-	"fmt"
-	"path/filepath"
-	"strings"
-
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
@@ -16,196 +12,121 @@ func (m Model) View() tea.View {
 	return v
 }
 
+// viewContent composes the persistent workspace shell: header, optional
+// sidebar, the main body (execution, instruction/context and review panels)
+// and footer. Help and modals replace the main body while the chrome and
+// sidebar stay visible.
 func (m Model) viewContent() string {
-	switch m.screen {
-	case scrSetup:
-		var b strings.Builder
-		if len(m.available) == 0 {
-			b.WriteString("No harness found (pi, codex, claude). Install one and re-run.")
+	v := m.workspace()
+	if v.Width <= 0 {
+		v.Width = 80
+	}
+	if v.Height <= 0 {
+		v.Height = 24
+	}
+
+	header := renderHeader(v)
+	footer := renderFooter(v)
+
+	mainH := v.Height - 2
+	if mainH < 3 {
+		mainH = 3
+	}
+
+	sidebarW := 0
+	if v.Width >= 100 {
+		sidebarW = clampInt(v.Width/5, 24, 30)
+	}
+	mainW := v.Width - sidebarW
+	if mainW < 1 {
+		mainW = 1
+	}
+
+	body := renderBody(v, mainW, mainH)
+
+	main := body
+	if sidebarW > 0 {
+		sidebar := renderSidebar(v, sidebarW, mainH)
+		main = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, body)
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, main, footer)
+}
+
+// renderBody lays out the main column at the given size, or the active
+// overlay when help or a modal is open.
+func renderBody(v workspaceView, w, h int) string {
+	if v.HelpVisible {
+		return renderHelp(v, w, h)
+	}
+	if v.ModalVisible {
+		return renderModal(v, w, h)
+	}
+
+	execH, middleH, reviewH, showMiddle := splitBodyHeights(h)
+	parts := make([]string, 0, 3)
+
+	execution := renderExecution(v, w, execH)
+	parts = append(parts, execution)
+
+	if showMiddle {
+		iw, cw := splitMiddleWidths(w)
+		instruction := renderInstruction(v, iw, middleH)
+		if cw > 0 {
+			parts = append(parts, lipgloss.JoinHorizontal(lipgloss.Top,
+				instruction, renderContext(v, cw, middleH)))
 		} else {
-			for i, h := range m.available {
-				if i > 0 {
-					b.WriteString("\n")
-				}
-				label := h
-				if v := m.harnessVersions[h]; v != "" {
-					label = h + " (" + v + ")"
-				}
-				if i == m.setupIdx {
-					b.WriteString(selectedItemStyle.Render("> " + label))
-				} else {
-					b.WriteString("  " + label)
-				}
-			}
+			parts = append(parts, instruction)
 		}
-		return m.renderForm("Select harness", b.String(), "Enter select · Ctrl+C quit")
-	case scrRange:
-		body := m.rangeInput.View()
-		if label := m.harnessLabel(); label != "" {
-			body = helpStyle.Render("harness: "+label) + "\n\n" + body
-		}
-		if m.rangeErr != "" {
-			body = errorStyle.Render(m.rangeErr) + "\n\n" + body
-		}
-		return m.renderForm("Commit range", body, "Enter continue · Ctrl+H switch harness")
-	case scrGenerate:
-		return m.renderForm("Generating instruction", m.outputViewport.View(), m.spinner.View()+" "+m.instructionStatus+" · esc skip")
-	case scrInstruction:
-		var b strings.Builder
-		if m.instructionStatus != "" {
-			b.WriteString(helpStyle.Render(m.instructionStatus) + "\n\n")
-		}
-		b.WriteString(m.instrInput.View())
-		b.WriteString("\n\nTab: don't modify final state = " + boolStr(m.dontModify))
-		return m.renderForm("Instruction", b.String(), "Enter run")
-	case scrRun:
-		return m.renderForm("Running", m.outputViewport.View(), m.spinner.View()+" "+m.runStatus+" · esc cancel")
-	case scrReview:
-		return m.renderReview()
-	case scrConfirm:
-		if m.pushing {
-			return m.renderForm("Confirm force-push", "Pushing...", "please wait")
-		}
-		var b strings.Builder
-		b.WriteString("Force-push the rewritten history?")
-		_, _ = fmt.Fprintf(&b, "\n\n%d patch(es) will be applied", len(m.patches))
-		hint := "y/n"
-		switch {
-		case m.pushErr != "":
-			_, _ = fmt.Fprintf(&b, "\n\ntarget unavailable: %s", m.pushErr)
-			hint = "n/q abort"
-		case m.pushRemote != "" || m.pushBranch != "":
-			_, _ = fmt.Fprintf(&b, "\n\ntarget: %s/%s", m.pushRemote, m.pushBranch)
-		}
-		return m.renderForm("Confirm force-push", b.String(), hint)
-	case scrDone:
-		if m.finalErr != nil {
-			return m.renderForm("Error", errorStyle.Render(m.finalMsg), "Enter/q exit")
-		}
-		return m.renderForm("Done", successStyle.Render(m.finalMsg), "Enter/q exit")
 	}
-	return ""
+
+	parts = append(parts, renderReviewPanel(v, w, reviewH))
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-// renderForm centres a bordered box holding a title, body and key hint at the
-// current terminal size. Used by every screen except review.
-func (m Model) renderForm(title, body, hint string) string {
-	w, h := m.dims()
-	content := body
-	if hint != "" {
-		if content != "" {
-			content += "\n\n"
+// splitBodyHeights divides the main column height between the execution
+// panel, the instruction/context row and the review panel. The middle row is
+// dropped when the remaining space would leave the review panel too short; in
+// that case execution and review share the height instead.
+func splitBodyHeights(mainH int) (execH, middleH, reviewH int, showMiddle bool) {
+	execH = clampInt(mainH/4, 6, 12)
+	middleH = clampInt(mainH/3, 8, 14)
+	reviewH = mainH - execH - middleH
+	if reviewH >= 6 {
+		return execH, middleH, reviewH, true
+	}
+
+	reviewH = mainH - execH
+	if reviewH < 6 {
+		// Too small for both minimums: keep the review's six rows and give
+		// execution whatever remains, without overrunning the column.
+		if execH = mainH - 6; execH < 1 {
+			execH = 1
 		}
-		content += helpStyle.Render(hint)
-	}
-	lines := 0
-	if content != "" {
-		lines = strings.Count(content, "\n") + 1
-	}
-	bh := lines + 3 // one title line plus two border rows
-	if bh > h {
-		bh = h
-	}
-	if bh < 3 {
-		bh = 3
-	}
-	box := renderBox(title, content, m.formBoxWidth(), bh, true)
-	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
-}
-
-// renderReview draws the lazygit-style review layout: the patch list on the
-// left, the diff viewport (or the editor while editing) on the right, and the
-// key hints in a full-width status bar along the bottom.
-func (m Model) renderReview() string {
-	cw, ch := m.dims()
-	bodyH := ch - 1 // bottom status bar
-	if bodyH < 3 {
-		bodyH = 3
-	}
-	lw, rw := m.reviewPaneWidths()
-
-	innerLW := lw - 2
-	if innerLW < 1 {
-		innerLW = 1
-	}
-	start, visible := m.reviewListStart()
-	// patchNames is populated when patches are produced; fall back to file
-	// names if a caller left it unset so the list is never blank.
-	labels := m.patchNames
-	if len(labels) != len(m.patches) {
-		labels = make([]string, len(m.patches))
-		for i, p := range m.patches {
-			labels[i] = filepath.Base(p)
+		reviewH = mainH - execH
+		if reviewH < 1 {
+			reviewH = 1
 		}
 	}
-	var list strings.Builder
-	for i := start; i < len(labels) && i < start+visible; i++ {
-		if i == m.selected {
-			list.WriteString(selectedItemStyle.Width(innerLW).Render(truncate("> "+labels[i], innerLW)))
-		} else {
-			list.WriteString(truncate("  "+labels[i], innerLW))
-		}
-		list.WriteString("\n")
-	}
-	left := renderBox("Patches", strings.TrimRight(list.String(), "\n"), lw, bodyH, !m.editing)
-
-	title := "Patch"
-	body := m.viewport.View()
-	if m.editing {
-		title = "Edit patch"
-		body = m.textarea.View()
-	}
-	right := renderBox(title, body, rw, bodyH, m.editing)
-
-	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-
-	hint := "↑/↓ select  e edit  r reprompt  a accept  q abort  pgup/pgdn ctrl+u/d scroll"
-	if m.editing {
-		hint = "Ctrl+S save  Esc cancel"
-	} else if label := m.harnessLabel(); label != "" {
-		hint += "  |  harness: " + label
-	}
-	if m.reviewStatus != "" {
-		hint += "  |  " + m.reviewStatus
-	}
-	return panes + "\n" + renderStatusBar(cw, hint)
+	return execH, 0, reviewH, false
 }
 
-// reviewListStart returns the index of the first patch row shown in the review
-// list and how many rows are visible, using the same scroll math as
-// renderReview so clicks and rendering agree.
-func (m Model) reviewListStart() (start, visible int) {
-	_, ch := m.dims()
-	bodyH := ch - 1 // bottom status bar
-	if bodyH < 3 {
-		bodyH = 3
+// splitMiddleWidths divides the main column width between the instruction
+// panel (about sixty percent) and the context panel. The context panel only
+// appears when the column is wide enough for both; otherwise cw is zero and
+// the instruction panel takes the full width.
+func splitMiddleWidths(mainW int) (iw, cw int) {
+	if mainW < 110 {
+		return mainW, 0
 	}
-	visible = bodyH - 3 // borders plus title row
-	if visible < 1 {
-		visible = 1
+	iw = mainW * 3 / 5
+	if iw < 1 {
+		iw = 1
 	}
-	start = 0
-	if m.selected >= visible {
-		start = m.selected - visible + 1
+	cw = mainW - iw
+	if cw < 1 {
+		cw = 0
+		iw = mainW
 	}
-	if maxStart := len(m.patches) - visible; start > maxStart {
-		start = maxStart
-	}
-	if start < 0 {
-		start = 0
-	}
-	return start, visible
-}
-
-// harnessLabel returns "<name> <version>" for the active harness, or the name
-// alone when its version is unknown. It is empty when no harness is selected.
-func (m Model) harnessLabel() string {
-	if m.h == nil {
-		return ""
-	}
-	name := m.h.Name()
-	if v := m.harnessVersions[name]; v != "" {
-		return name + " " + v
-	}
-	return name
+	return iw, cw
 }

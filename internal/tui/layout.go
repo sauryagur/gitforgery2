@@ -4,11 +4,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/sauryagur/gitforgery2/internal/git"
 )
 
 // loadSelectedPatch reads the selected patch into both the textarea (edit
 // mode) and the diff viewport (view mode). Out-of-range selections clear both.
 func (m *Model) loadSelectedPatch() {
+	m.reloadDiff()
+	m.diffOffset = 0
 	if m.selected < 0 || m.selected >= len(m.patches) {
 		m.textarea.SetValue("")
 		m.viewport.SetContent("")
@@ -27,9 +31,12 @@ func (m *Model) loadSelectedPatch() {
 }
 
 // refreshPatchView reloads the selected patch so the diff pane matches the
-// current patch list and pane size.
+// current patch list and pane size. The scroll offset survives a resize;
+// diffWindow clamps it to the new content.
 func (m *Model) refreshPatchView() {
+	offset := m.diffOffset
 	m.loadSelectedPatch()
+	m.diffOffset = offset
 }
 
 // resize recomputes widget sizes from the terminal dimensions. Zero
@@ -46,7 +53,8 @@ func (m *Model) resize() {
 		inputW = 10
 	}
 	m.rangeInput.SetWidth(inputW)
-	m.instrInput.SetWidth(inputW)
+	m.instrArea.SetWidth(inputW)
+	m.instrArea.SetHeight(6)
 
 	_, ch := m.dims()
 	bodyH := ch - 1 // bottom status bar
@@ -134,6 +142,38 @@ func (m Model) reviewPaneWidths() (int, int) {
 	return lw, rw
 }
 
+// reviewListMetrics returns the absolute X offset of the patch list, its pane
+// width, the first visible patch index, and how many two-line items fit.
+func (m Model) reviewListMetrics() (x0, lw, start, visible int) {
+	w, h := m.dims()
+	sidebarW := 0
+	if w >= 100 {
+		sidebarW = clampInt(w/5, 24, 30)
+	}
+	mainW := w - sidebarW
+	lw = clampInt(mainW/3, 28, 38)
+
+	_, _, reviewH, _ := splitBodyHeights(max(3, h-2))
+	visible = (reviewH - 3) / 2 // borders + title; two-line rows
+	if visible < 1 {
+		visible = 1
+	}
+
+	start = 0
+	if m.selected >= visible {
+		start = clampInt(m.selected-visible+1, 0, max(0, len(m.patches)-visible))
+	}
+	x0 = sidebarW
+	return x0, lw, start, visible
+}
+
+// reviewListStart reports the first visible patch index and how many
+// two-line items fit in the review list.
+func (m Model) reviewListStart() (start, visible int) {
+	_, _, start, visible = m.reviewListMetrics()
+	return start, visible
+}
+
 // clampInt returns v limited to [low, high].
 func clampInt(v, low, high int) int {
 	if high < low {
@@ -187,4 +227,69 @@ func stripPatchPrefix(subject string) string {
 		}
 	}
 	return subject
+}
+
+// parseDiffLines splits unified diff text into classified lines for the diff
+// pane. Hunk and file-header lines are tagged so the renderer can style them
+// separately; content lines keep their leading '+'/'-' marker.
+func parseDiffLines(text string) []diffLine {
+	if text == "" {
+		return nil
+	}
+	text = strings.TrimSuffix(text, "\n")
+	raw := strings.Split(text, "\n")
+	lines := make([]diffLine, 0, len(raw))
+	for _, line := range raw {
+		var kind diffKind
+		switch {
+		case strings.HasPrefix(line, "diff --git "),
+			strings.HasPrefix(line, "index "),
+			strings.HasPrefix(line, "---"),
+			strings.HasPrefix(line, "+++"):
+			kind = diffHeader
+		case strings.HasPrefix(line, "@@"):
+			kind = diffHunk
+		case strings.HasPrefix(line, "+"):
+			kind = diffAdd
+		case strings.HasPrefix(line, "-"):
+			kind = diffDel
+		default:
+			kind = diffContext
+		}
+		lines = append(lines, diffLine{Kind: kind, Text: line})
+	}
+	return lines
+}
+
+// patchItemsFrom builds the review-side patch list, hiding git's patch
+// machinery behind a short subject and per-patch line counts. Unreadable
+// patches yield zero counts rather than an error.
+func patchItemsFrom(paths []string) []patchItem {
+	items := make([]patchItem, len(paths))
+	for i, path := range paths {
+		item := patchItem{Index: i + 1, Title: patchSubject(path)}
+		if stat, err := git.PatchStats(path); err == nil {
+			item.Files = stat.Files
+			item.Additions = stat.Additions
+			item.Deletions = stat.Deletions
+		}
+		items[i] = item
+	}
+	return items
+}
+
+// diffWindow returns the lines visible at the given scroll offset and the
+// total line count. The offset is clamped so the window never runs past the
+// end of the diff.
+func diffWindow(lines []diffLine, offset, height int) (visible []diffLine, total int) {
+	total = len(lines)
+	if height <= 0 {
+		return nil, total
+	}
+	offset = clampInt(offset, 0, max(0, total-height))
+	end := offset + height
+	if end > total {
+		end = total
+	}
+	return lines[offset:end], total
 }

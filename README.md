@@ -65,9 +65,10 @@ Instruction generation is capped by the same 3-minute timeout as a run.
 
 | Key | Action |
 | --- | --- |
-| typing | Edit the instruction |
+| typing | Edit the instruction (multi-line) |
+| `enter` | Insert a newline |
 | `tab` | Toggle "Don't modify final state" (see [Safety](#safety)) |
-| `enter` | Accept the instruction and run the harness |
+| `ctrl+s` / `ctrl+enter` | Accept the instruction and run the harness |
 | `esc` | Return to the Range screen |
 
 An empty instruction defaults to `improve commit messages`.

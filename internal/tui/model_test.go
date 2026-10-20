@@ -21,7 +21,7 @@ import (
 func testModel() Model {
 	return Model{
 		rangeInput:     textinput.New(),
-		instrInput:     textinput.New(),
+		instrArea:      textarea.New(),
 		textarea:       textarea.New(),
 		viewport:       viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
 		outputViewport: viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
@@ -77,7 +77,7 @@ func TestViewNoPanic(t *testing.T) {
 	patches, names := realPatches(t)
 
 	screens := []int{scrSetup, scrRange, scrGenerate, scrInstruction, scrRun, scrReview, scrConfirm, scrDone}
-	sizes := [][2]int{{0, 0}, {120, 40}}
+	sizes := [][2]int{{0, 0}, {160, 50}}
 	for _, scr := range screens {
 		for _, wh := range sizes {
 			m := testModel()
@@ -95,22 +95,28 @@ func TestViewNoPanic(t *testing.T) {
 	}
 }
 
-// TestReviewEditViewRenders checks the review screen renders both the patch
-// list pane and the editor pane without panicking.
-func TestReviewEditViewRenders(t *testing.T) {
+// TestReviewShellRenders checks the review screen renders the workspace shell:
+// the patch list, diff pane title, and workflow sidebar. Edit mode swaps the
+// diff title for the patch editor title.
+func TestReviewShellRenders(t *testing.T) {
 	patches, names := realPatches(t)
 	m := testModel()
 	m.screen = scrReview
-	m.width, m.height = 120, 40
+	m.width, m.height = 160, 50
 	m.patches = patches
 	m.patchNames = names
 	m.resize()
-	if got := m.viewContent(); !strings.Contains(got, names[0]) {
-		t.Fatalf("review view does not list the first patch:\n%s", got)
+
+	got := m.viewContent()
+	for _, want := range []string{"Patches", "Patch Review", "Workflow"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("review shell does not contain %q:\n%s", want, got)
+		}
 	}
+
 	m.editing = true
-	if got := m.viewContent(); strings.TrimSpace(got) == "" {
-		t.Fatal("editing review view is empty")
+	if got := m.viewContent(); !strings.Contains(got, "Edit patch") {
+		t.Fatalf("editing review shell does not contain %q:\n%s", "Edit patch", got)
 	}
 }
 
@@ -460,9 +466,9 @@ func TestInvalidRangeStaysInline(t *testing.T) {
 func TestEscBacksOutOfInstruction(t *testing.T) {
 	m := testModel()
 	m.screen = scrInstruction
-	m.instructionStatus = "generated; edit and press enter"
-	m.instrInput.SetValue("make it concise")
-	m.instrInput.Focus()
+	m.instructionStatus = "generated; edit and press ctrl+enter"
+	m.instrArea.SetValue("make it concise")
+	m.instrArea.Focus()
 
 	nm, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
 	if cmd != nil {
@@ -472,10 +478,10 @@ func TestEscBacksOutOfInstruction(t *testing.T) {
 	if got.screen != scrRange {
 		t.Fatalf("screen = %d, want scrRange", got.screen)
 	}
-	if got.instrInput.Value() != "make it concise" {
-		t.Fatalf("instruction after esc = %q, want preserved", got.instrInput.Value())
+	if got.instrArea.Value() != "make it concise" {
+		t.Fatalf("instruction after esc = %q, want preserved", got.instrArea.Value())
 	}
-	if got.instrInput.Focused() {
+	if got.instrArea.Focused() {
 		t.Fatal("instruction input still focused after esc")
 	}
 	if !got.rangeInput.Focused() {
@@ -489,7 +495,7 @@ func TestRepromptResetOnEsc(t *testing.T) {
 	m := testModel()
 	m.screen = scrReview
 	m.instruction = "make it concise"
-	m.instrInput.SetValue("make it concise")
+	m.instrArea.SetValue("make it concise")
 
 	nm, _ := m.Update(tea.KeyPressMsg{Text: "r", Code: 'r'})
 	got := nm.(Model)
@@ -531,8 +537,8 @@ func TestHarnessOutputRearmsOwnChannel(t *testing.T) {
 	}
 }
 
-// TestMouseClickSelectsPatch verifies that clicking the second row of the left
-// pane selects the second patch.
+// TestMouseClickSelectsPatch verifies that clicking the second two-line row of
+// the left pane selects the second patch.
 func TestMouseClickSelectsPatch(t *testing.T) {
 	patches, names := realPatches(t)
 	m := testModel()
@@ -542,8 +548,11 @@ func TestMouseClickSelectsPatch(t *testing.T) {
 	m.patchNames = names
 	m.resize()
 
-	lw, _ := m.reviewPaneWidths()
-	nm, cmd := m.Update(tea.MouseClickMsg{X: lw / 2, Y: 3, Button: tea.MouseLeft})
+	x0, lw, _, _ := m.reviewListMetrics()
+	if x0 != 24 || lw != 32 {
+		t.Fatalf("review list metrics = x0 %d lw %d, want 24/32", x0, lw)
+	}
+	nm, cmd := m.Update(tea.MouseClickMsg{X: 24 + 5, Y: 4, Button: tea.MouseLeft})
 	if cmd != nil {
 		t.Fatal("mouse click returned a command")
 	}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
@@ -28,6 +30,10 @@ const (
 	scrDone
 )
 
+// maxLogLines bounds the retained harness log so a chatty run cannot grow the
+// execution panel's history without limit.
+const maxLogLines = 5000
+
 type runResultMsg struct {
 	patchDir string
 	patches  []string
@@ -35,7 +41,12 @@ type runResultMsg struct {
 	// onto the Model as originalTree; it cannot be set from the command closure
 	// because Update/handleKey have value receivers.
 	tree string
-	err  error
+	// stats summarizes the rewritten range for the session header; originalDir
+	// holds the pre-edit copies of the patches so the review screen can show
+	// the original side of the diff.
+	stats       git.SessionStats
+	originalDir string
+	err         error
 }
 
 type pushResultMsg struct {
@@ -49,13 +60,19 @@ type instructionResultMsg struct {
 	err  error
 }
 
+// elapsedMsg re-arms the run timer once per second while the harness runs so
+// the execution panel can show a live elapsed time.
+type elapsedMsg struct{}
+
 // harnessOutputMsg carries a single line of harness stdout/stderr streamed
 // live while a harness command runs. ch is the per-run channel the line came
 // from; Update re-arms that channel so a superseded run's late output cannot
 // resume draining a newer run's channel.
 type harnessOutputMsg struct {
-	line string
-	ch   chan tea.Msg
+	line  string
+	ch    chan tea.Msg
+	at    time.Time
+	stage string
 }
 
 type Model struct {
@@ -93,7 +110,7 @@ type Model struct {
 	// Ctrl+C.
 	pushing     bool
 	pushCancel  context.CancelFunc
-	instrInput  textinput.Model
+	instrArea   textarea.Model
 	instruction string
 	// instructionStatus is shown while generating and on the instruction
 	// screen; generateSeq tags generation results so stale ones are dropped.
@@ -104,6 +121,33 @@ type Model struct {
 	// originalTree is the HEAD tree at the start of the run, reused when
 	// reprompting so the final-state check still compares against it.
 	originalTree string
+
+	// step/stepStatus drive the workflow sidebar; step is the current stage and
+	// stepStatus records how each stage went so the sidebar can colour them.
+	step       int
+	stepStatus [stepCount]stepStatus
+
+	// session summarizes the confirmed range for the sidebar, and the run
+	// timer plus harness log feed the execution panel.
+	session    git.SessionStats
+	logs       []logLine
+	runStarted time.Time
+	elapsed    string
+
+	// originalDir holds the pre-edit patches and showOriginal selects which
+	// side of the diff the review screen shows.
+	originalDir  string
+	showOriginal bool
+	helpVisible  bool
+	// diffLines is the selected patch's parsed diff, windowed into
+	// workspaceView.Diff through diffOffset.
+	diffLines  []diffLine
+	diffOffset int
+	// patchItems caches the reviewed patches' metadata so workspace() does not
+	// re-read every patch file on each frame.
+	patchItems []patchItem
+	// pushed records a successful force-push for the header state chip.
+	pushed bool
 
 	spinner   spinner.Model
 	runStatus string
@@ -141,6 +185,8 @@ func New(repo string) Model {
 	ti.Focus()
 	ta := textarea.New()
 	ta.Placeholder = "patch contents"
+	ia := textarea.New()
+	ia.Placeholder = "rewrite commit messages to be concise"
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	m := Model{
@@ -149,13 +195,13 @@ func New(repo string) Model {
 		height:         24,
 		repo:           repo,
 		rangeInput:     ti,
-		instrInput:     textinput.New(),
+		instrArea:      ia,
 		textarea:       ta,
 		viewport:       viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
 		outputViewport: viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
 		spinner:        sp,
 	}
-	m.instrInput.Placeholder = "rewrite commit messages to be concise"
+	m.stepStatus[stepRange] = stepActive
 	m.available = harness.Detect()
 	m.harnessVersions = harnessVersions(m.available)
 	m.resize()
@@ -257,20 +303,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pushing {
 			return m, nil
 		}
-		// In the review screen's view mode the pager keys scroll the diff
-		// viewport; every other key keeps its selection/edit/accept behavior
-		// below (and in handleKey).
+		// Help is a global overlay: it toggles on every screen, and esc closes
+		// it before the active screen (or its focused widget) sees the key.
+		if keyMsg.String() == "?" {
+			m.helpVisible = !m.helpVisible
+			return m, nil
+		}
+		if keyMsg.String() == "esc" && m.helpVisible {
+			m.helpVisible = false
+			return m, nil
+		}
+		// In the review screen's view mode the pager keys scroll the windowed
+		// diff; every other key keeps its selection/edit/accept behavior below
+		// (and in handleKey).
 		if m.screen == scrReview && !m.editing {
 			switch keyMsg.String() {
-			case "pgup", "pgdown", "ctrl+u", "ctrl+d":
-				var cmd tea.Cmd
-				m.viewport, cmd = m.viewport.Update(msg)
-				return m, cmd
+			case "pgup":
+				m.scrollDiff(-m.diffViewHeight())
+				return m, nil
+			case "pgdown":
+				m.scrollDiff(m.diffViewHeight())
+				return m, nil
+			case "ctrl+u":
+				m.scrollDiff(-1)
+				return m, nil
+			case "ctrl+d":
+				m.scrollDiff(1)
+				return m, nil
 			case "home":
-				m.viewport.GotoTop()
+				m.diffOffset = 0
 				return m, nil
 			case "end":
-				m.viewport.GotoBottom()
+				m.diffOffset = max(0, len(m.diffLines)-m.diffViewHeight())
 				return m, nil
 			}
 		}
@@ -279,9 +343,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.rangeInput, cmd = m.rangeInput.Update(msg)
 			return m, cmd
-		case m.screen == scrInstruction && keyMsg.String() != "enter" && keyMsg.String() != "tab" && keyMsg.String() != "esc":
+		case m.screen == scrInstruction && keyMsg.String() != "esc" && keyMsg.String() != "tab" && keyMsg.String() != "ctrl+enter" && keyMsg.String() != "ctrl+s":
 			var cmd tea.Cmd
-			m.instrInput, cmd = m.instrInput.Update(msg)
+			m.instrArea, cmd = m.instrArea.Update(msg)
 			return m, cmd
 		case m.screen == scrReview && m.editing && keyMsg.String() != "ctrl+s" && keyMsg.String() != "esc":
 			var cmd tea.Cmd
@@ -308,6 +372,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.outputViewport.SetContent(strings.Join(m.runOutput, "\n"))
 		m.outputViewport.GotoBottom()
+		at := msg.at
+		if at.IsZero() {
+			at = time.Now()
+		}
+		m.logs = append(m.logs, logLine{At: at.Format("15:04:05"), Stage: msg.stage, Text: msg.line})
+		if len(m.logs) > maxLogLines {
+			m.logs = m.logs[len(m.logs)-maxLogLines:]
+		}
 		// Keep draining on any screen so background output never blocks the
 		// harness process. Re-arm the channel this line came from so output
 		// from a superseded run cannot resume draining a newer run's channel.
@@ -354,6 +426,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selected = 0
 		m.patchNames = patchLabels(m.patches)
 		m.textarea.Blur()
+		// The run finished; the review stage is now active. Validation is
+		// satisfied up front when the harness must not modify the final tree.
+		m.stepStatus[stepRun] = stepDone
+		m.step = stepReview
+		m.stepStatus[stepReview] = stepActive
+		if m.dontModify {
+			m.stepStatus[stepValidate] = stepDone
+		} else {
+			m.stepStatus[stepValidate] = stepPending
+		}
+		// A reprompt reuses the original stats and originals; only a fresh
+		// run reports them, so never blank the session on an empty result.
+		if msg.stats != (git.SessionStats{}) {
+			m.session = msg.stats
+		}
+		if msg.originalDir != "" {
+			m.originalDir = msg.originalDir
+		}
+		m.patchItems = patchItemsFrom(m.patches)
+		m.showOriginal = false
+		m.diffOffset = 0
+		m.diffLines = nil
+		if len(m.patches) > 0 {
+			m.diffLines = patchDiffLines(m.patches[0])
+		}
+		m.runStarted = time.Now()
+		m.logs = nil
+		m.elapsed = ""
 		// resize sizes the review panes and refreshes the diff viewport.
 		m.resize()
 		return m, nil
@@ -371,6 +471,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			m.finalMsg = msg.msg
+			m.pushed = true
+			m.stepStatus[stepPush] = stepDone
 		}
 		m.screen = scrDone
 		return m, nil
@@ -383,16 +485,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.runCh = nil
 		m.runCancel = nil
 		m.screen = scrInstruction
+		m.step = stepInstruction
+		m.stepStatus[stepInstruction] = stepActive
 		if msg.err != nil {
 			m.instructionStatus = "generation failed: " + msg.err.Error()
-			m.instrInput.SetValue("")
+			m.instrArea.SetValue("")
 		} else {
-			m.instructionStatus = "generated; edit and press enter"
-			if strings.TrimSpace(m.instrInput.Value()) == "" {
-				m.instrInput.SetValue(msg.text)
+			m.instructionStatus = "generated; edit and press ctrl+s"
+			if strings.TrimSpace(m.instrArea.Value()) == "" {
+				m.instrArea.SetValue(msg.text)
 			}
 		}
-		m.instrInput.Focus()
+		m.instrArea.Focus()
+		return m, nil
+	case elapsedMsg:
+		if !m.runStarted.IsZero() {
+			m.elapsed = time.Since(m.runStarted).Round(time.Second).String()
+		}
+		if m.screen == scrRun {
+			return m, tickElapsed()
+		}
 		return m, nil
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -406,7 +518,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	if m.screen == scrInstruction {
 		var cmd tea.Cmd
-		m.instrInput, cmd = m.instrInput.Update(msg)
+		m.instrArea, cmd = m.instrArea.Update(msg)
 		return m, cmd
 	}
 	if m.screen == scrReview && m.editing {
@@ -432,18 +544,24 @@ func (m Model) handleWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
 				if m.selected > 0 {
 					m.selected--
 					m.loadSelectedPatch()
+					m.reloadDiff()
 				}
 			case tea.MouseWheelDown:
 				if m.selected < len(m.patches)-1 {
 					m.selected++
 					m.loadSelectedPatch()
+					m.reloadDiff()
 				}
 			}
 			return m, nil
 		}
-		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
-		return m, cmd
+		switch msg.Button {
+		case tea.MouseWheelUp:
+			m.scrollDiff(-1)
+		case tea.MouseWheelDown:
+			m.scrollDiff(1)
+		}
+		return m, nil
 	case scrRun, scrGenerate:
 		var cmd tea.Cmd
 		m.outputViewport, cmd = m.outputViewport.Update(msg)
@@ -458,18 +576,22 @@ func (m Model) handleClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
 	if m.screen != scrReview || m.editing {
 		return m, nil
 	}
-	lw, _ := m.reviewPaneWidths()
-	if msg.X >= lw {
+	x0, lw, start, visible := m.reviewListMetrics()
+	if msg.X < x0 || msg.X >= x0+lw {
 		return m, nil
 	}
-	start, visible := m.reviewListStart()
-	// The list content starts two rows down (top border plus title row).
-	idx := start + msg.Y - 2
+	// The list content starts two rows down (top border plus title row), and
+	// each patch occupies two lines.
+	if msg.Y < 2 {
+		return m, nil
+	}
+	idx := start + (msg.Y-2)/2
 	if idx < start || idx >= start+visible || idx >= len(m.patches) {
 		return m, nil
 	}
 	m.selected = idx
 	m.loadSelectedPatch()
+	m.reloadDiff()
 	return m, nil
 }
 
@@ -511,7 +633,7 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.screen = scrRange
 			m.prefillRange()
 			m.rangeInput.Focus()
-			m.instrInput.Blur()
+			m.instrArea.Blur()
 			m.textarea.Blur()
 		}
 	case scrRange:
@@ -530,7 +652,7 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				}
 			}
 			m.rangeInput.Blur()
-			m.instrInput.Blur()
+			m.instrArea.Blur()
 			m.textarea.Blur()
 			m.screen = scrSetup
 			return m, nil
@@ -571,6 +693,12 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			m.reprompting = false
 			m.rangeInput.Blur()
 			m.instructionStatus = "generating instruction..."
+			m.stepStatus[stepRange] = stepDone
+			m.step = stepInstruction
+			for i := stepRun; i < stepCount; i++ {
+				m.stepStatus[i] = stepPending
+			}
+			m.stepStatus[stepInstruction] = stepActive
 			m.screen = scrGenerate
 			cmd := m.generateInstruction()
 			return m, cmd
@@ -585,7 +713,9 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			// Bump the sequence so any in-flight generation result is dropped.
 			m.generateSeq++
 			m.screen = scrInstruction
-			m.instrInput.Focus()
+			m.step = stepInstruction
+			m.stepStatus[stepInstruction] = stepActive
+			m.instrArea.Focus()
 			m.instructionStatus = "generation skipped"
 			// Keep draining the skipped generation's output so its writer
 			// never blocks; the stale result leaves the drain alone.
@@ -594,7 +724,7 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			}
 		}
 	case scrRun:
-		if key == "esc" {
+		if key == "esc" || key == "c" {
 			if m.runCancel != nil {
 				m.runCancel()
 				m.runCancel = nil
@@ -613,23 +743,34 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			// it is still there if the user returns, and drop any reprompt
 			// intent so the flow restarts cleanly.
 			m.reprompting = false
-			m.instrInput.Blur()
+			m.instrArea.Blur()
 			m.rangeInput.Focus()
 			m.screen = scrRange
-		case "enter":
-			m.instrInput.Blur()
+			m.step = stepRange
+			m.stepStatus[stepRange] = stepActive
+			m.stepStatus[stepInstruction] = stepPending
+		case "ctrl+enter", "ctrl+s":
+			m.instrArea.Blur()
 			m.instructionStatus = ""
-			m.instruction = strings.TrimSpace(m.instrInput.Value())
+			m.instruction = strings.TrimSpace(m.instrArea.Value())
 			if m.instruction == "" {
 				m.instruction = "improve commit messages"
 			}
 			m.screen = scrRun
-			if m.reprompting {
-				cmd := m.rerunHarness()
-				return m, cmd
+			m.runStatus = "running"
+			m.stepStatus[stepInstruction] = stepDone
+			m.step = stepRun
+			m.stepStatus[stepRun] = stepActive
+			for i := stepReview; i < stepCount; i++ {
+				m.stepStatus[i] = stepPending
 			}
-			cmd := m.startRun()
-			return m, cmd
+			m.runStarted = time.Now()
+			m.elapsed = ""
+			m.logs = nil
+			if m.reprompting {
+				return m, tea.Batch(m.rerunHarness(), tickElapsed())
+			}
+			return m, tea.Batch(m.startRun(), tickElapsed())
 		}
 	case scrReview:
 		if m.editing {
@@ -647,6 +788,7 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				m.textarea.Blur()
 				m.reviewStatus = "saved"
 				m.refreshPatchView()
+				m.reloadDiff()
 			case "esc":
 				m.editing = false
 				m.textarea.Blur()
@@ -658,23 +800,38 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 			if m.selected > 0 {
 				m.selected--
 				m.loadSelectedPatch()
+				m.reloadDiff()
 			}
 		case "down", "j":
 			if m.selected < len(m.patches)-1 {
 				m.selected++
 				m.loadSelectedPatch()
+				m.reloadDiff()
 			}
 		case "e":
 			m.editing = true
 			m.loadSelectedPatch()
 			m.textarea.Focus()
+		case "o":
+			// Flip between the harness-edited patch and the copy taken before
+			// the run; reload so the diff pane follows the toggle.
+			m.showOriginal = !m.showOriginal
+			m.diffOffset = 0
+			m.reloadDiff()
+			if m.showOriginal {
+				m.reviewStatus = "showing original"
+			} else {
+				m.reviewStatus = ""
+			}
 		case "r":
 			m.editing = false
 			m.textarea.Blur()
 			m.reprompting = true
-			m.instrInput.SetValue(m.instruction)
+			m.instrArea.SetValue(m.instruction)
 			m.screen = scrInstruction
-			m.instrInput.Focus()
+			m.step = stepInstruction
+			m.stepStatus[stepInstruction] = stepActive
+			m.instrArea.Focus()
 		case "a", "enter":
 			m.pushErr = ""
 			remote, branch, err := git.RemoteBranch(m.repo)
@@ -684,6 +841,9 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 				m.pushRemote = remote
 				m.pushBranch = branch
 			}
+			m.stepStatus[stepValidate] = stepDone
+			m.step = stepPush
+			m.stepStatus[stepPush] = stepActive
 			m.screen = scrConfirm
 		case "q", "esc":
 			m.cleanup()
@@ -714,6 +874,178 @@ func (m Model) handleKey(key string) (Model, tea.Cmd) {
 	return m, nil
 }
 
+// tickElapsed schedules the next elapsed-time tick. Update re-arms it while
+// the run screen is active and stops re-arming everywhere else.
+func tickElapsed() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return elapsedMsg{} })
+}
+
+// diffViewHeight returns how many diff rows the review pane can show. The
+// layout reserves one header row, one footer row, and each panel's two border
+// rows plus its title row.
+func (m Model) diffViewHeight() int {
+	_, ch := m.dims()
+	h := ch - 5
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
+// scrollDiff moves the diff window by delta rows, clamped to the diff bounds.
+func (m *Model) scrollDiff(delta int) {
+	maxOffset := len(m.diffLines) - m.diffViewHeight()
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	m.diffOffset = clampInt(m.diffOffset+delta, 0, maxOffset)
+}
+
+// reloadDiff rebuilds diffLines for the selected patch, honouring the
+// showOriginal toggle. Missing originals fall back to the working patch.
+func (m *Model) reloadDiff() {
+	m.diffLines = nil
+	if m.selected < 0 || m.selected >= len(m.patches) {
+		return
+	}
+	path := m.patches[m.selected]
+	if m.showOriginal && m.originalDir != "" {
+		orig := filepath.Join(m.originalDir, filepath.Base(path))
+		if data, err := os.ReadFile(orig); err == nil {
+			m.diffLines = parseDiffLines(string(data))
+			return
+		}
+	}
+	m.diffLines = patchDiffLines(path)
+}
+
+// patchDiffLines parses a patch file into renderable diff lines. An unreadable
+// patch yields no lines rather than failing the whole screen.
+func patchDiffLines(path string) []diffLine {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return parseDiffLines(string(data))
+}
+
+// workspace assembles the view model the shell and panels render. It is the
+// single translation point from Model state to workspaceView, so renderers
+// never read Model fields directly.
+func (m Model) workspace() workspaceView {
+	w, h := m.dims()
+	v := workspaceView{Width: w, Height: h}
+
+	v.Branch = m.session.Branch
+	v.Pushed = m.pushed
+
+	v.Step = m.step
+	v.StepStatus = m.stepStatus
+
+	v.Commits = m.session.Commits
+	v.Files = m.session.Files
+	v.Additions = m.session.Additions
+	v.Deletions = m.session.Deletions
+
+	if m.h != nil {
+		name := m.h.Name()
+		v.Harness = name
+		v.HarnessVersion = m.harnessVersions[name]
+	}
+	v.HarnessStatus = m.runStatus
+	if v.HarnessStatus == "" {
+		v.HarnessStatus = m.instructionStatus
+	}
+	if v.HarnessStatus == "" {
+		v.HarnessStatus = "idle"
+	}
+	v.HarnessRunning = m.runCancel != nil || m.screen == scrRun || m.screen == scrGenerate
+
+	v.RangeDesc = m.rangeSpec
+	v.PatchCount = len(m.patches)
+	v.FinalTreeMatch = m.dontModify
+
+	v.Logs = m.logs
+	v.Elapsed = m.elapsed
+
+	v.Instruction = m.instruction
+	switch {
+	case m.screen == scrInstruction:
+		v.Instruction = m.instrArea.Value()
+		v.InstructionLine = m.instrArea.Line()
+	case v.Instruction == "":
+		v.Instruction = m.instrArea.Value()
+	}
+	v.InstructionEditing = m.screen == scrInstruction
+	v.InstructionErr = m.instructionStatus
+
+	v.Patches = m.patchItems
+	if len(v.Patches) == 0 && len(m.patches) > 0 {
+		v.Patches = patchItemsFrom(m.patches)
+	}
+	v.Selected = m.selected
+	start, _ := m.reviewListStart()
+	v.ListStart = start
+	v.Diff, v.DiffTotal = diffWindow(m.diffLines, m.diffOffset, m.diffViewHeight())
+	v.DiffOffset = m.diffOffset
+	v.ShowOriginal = m.showOriginal
+	v.EditingPatch = m.editing
+	v.ReviewStatus = m.reviewStatus
+
+	v.HelpVisible = m.helpVisible
+
+	v.Harnesses = m.available
+	v.HarnessIdx = m.setupIdx
+	v.RangeValue = m.rangeInput.Value()
+	v.RangeErr = m.rangeErr
+
+	// The setup, range, confirm and done screens render as modal layers over
+	// the workspace rather than as their own full-screen forms.
+	switch m.screen {
+	case scrSetup:
+		v.ModalVisible = true
+		v.ModalTitle = "Select Harness"
+		v.ModalBody = "Choose the agent harness that will edit the patches."
+		v.ModalHint = "↑/↓ choose · enter confirm"
+	case scrRange:
+		v.ModalVisible = true
+		v.ModalTitle = "Select Range"
+		v.ModalHint = "enter confirm · ctrl+h change harness"
+	case scrConfirm:
+		v.ModalVisible = true
+		v.ModalTitle = "Confirm force-push"
+		var b strings.Builder
+		b.WriteString("Force-push the rewritten history?")
+		_, _ = fmt.Fprintf(&b, "\n\n%d patch(es) will be applied", len(m.patches))
+		switch {
+		case m.pushErr != "":
+			_, _ = fmt.Fprintf(&b, "\n\ntarget unavailable: %s", m.pushErr)
+			v.ModalHint = "n/q abort"
+		case m.pushRemote != "" || m.pushBranch != "":
+			_, _ = fmt.Fprintf(&b, "\n\ntarget: %s/%s", m.pushRemote, m.pushBranch)
+		}
+		if m.pushing {
+			b.Reset()
+			b.WriteString("Pushing...")
+			v.ModalHint = "please wait"
+		}
+		v.ModalBody = b.String()
+		if v.ModalHint == "" {
+			v.ModalHint = "y/enter push · n abort"
+		}
+	case scrDone:
+		v.ModalVisible = true
+		v.ModalTitle = "Done"
+		if m.finalErr != nil {
+			v.ModalTitle = "Error"
+		}
+		v.ModalBody = m.finalMsg
+		v.ModalHint = "enter/q exit"
+	}
+
+	return v
+}
+
 func (m *Model) cleanup() {
 	if m.patchDir != "" {
 		_ = os.RemoveAll(m.patchDir)
@@ -726,11 +1058,4 @@ func Run(repo string) error {
 	p := tea.NewProgram(m)
 	_, err := p.Run()
 	return err
-}
-
-func boolStr(b bool) string {
-	if b {
-		return "true"
-	}
-	return "false"
 }
