@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -48,7 +49,7 @@ func streamCommand(ctx context.Context, bin string, args []string, dir string, c
 	// Each pipe is drained by its own scanner so neither stream can block the
 	// child while the other is being consumed. The readers must finish before
 	// Wait because Wait closes the pipes.
-	read := func(r io.Reader, buf *strings.Builder, prefix string) {
+	read := func(r io.Reader, buf *strings.Builder, prefix, stage string) {
 		defer readers.Done()
 		sc := bufio.NewScanner(r)
 		sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -59,7 +60,7 @@ func streamCommand(ctx context.Context, bin string, args []string, dir string, c
 			}
 			buf.WriteString(line)
 			if ch != nil {
-				ch <- harnessOutputMsg{line: prefix + line, ch: ch}
+				ch <- harnessOutputMsg{at: time.Now(), line: prefix + line, ch: ch, stage: stage}
 			}
 		}
 		if sc.Err() != nil {
@@ -69,8 +70,8 @@ func streamCommand(ctx context.Context, bin string, args []string, dir string, c
 		}
 	}
 	readers.Add(2)
-	go read(outPipe, &outBuf, "")
-	go read(errPipe, &errBuf, "stderr: ")
+	go read(outPipe, &outBuf, "", "")
+	go read(errPipe, &errBuf, "stderr: ", "stderr")
 	readers.Wait()
 	waitErr := cmd.Wait()
 	return outBuf.String(), errBuf.String(), waitErr
@@ -123,6 +124,9 @@ func generateInstructionResult(m Model, seq int, ctx context.Context, ch chan te
 	if m.runCancel != nil {
 		defer m.runCancel()
 	}
+	if ch != nil {
+		ch <- harnessOutputMsg{at: time.Now(), line: "Generating instruction...", ch: ch, stage: "instruction"}
+	}
 	repo := m.repo
 	rangeSpec := m.rangeSpec
 	h := m.h
@@ -151,6 +155,9 @@ func generateInstructionResult(m Model, seq int, ctx context.Context, ch chan te
 			return instructionResultMsg{seq: seq, err: fmt.Errorf("harness produced an empty instruction: %s", s)}
 		}
 		return instructionResultMsg{seq: seq, err: fmt.Errorf("harness produced an empty instruction")}
+	}
+	if ch != nil {
+		ch <- harnessOutputMsg{at: time.Now(), line: "Instruction ready", ch: ch, stage: "instruction"}
 	}
 	return instructionResultMsg{seq: seq, text: text}
 }
@@ -193,6 +200,7 @@ func startRunResult(m Model, ctx context.Context, ch chan tea.Msg) runResultMsg 
 	if end != head {
 		return runResultMsg{err: fmt.Errorf("range must end at HEAD")}
 	}
+	stats, _ := git.CollectSessionStats(repo, base, end)
 	m.rangeBase = base
 	if err := git.CreateBackupRef(repo); err != nil {
 		return runResultMsg{err: err}
@@ -209,30 +217,54 @@ func startRunResult(m Model, ctx context.Context, ch chan tea.Msg) runResultMsg 
 	if err != nil {
 		return runResultMsg{err: err}
 	}
+	// Original copies live beside the working patches for the review pane's
+	// "show original" toggle; the directory is kept on every path.
+	origDir := filepath.Join(tmp, "original")
+	if err := os.MkdirAll(origDir, 0o755); err != nil {
+		return runResultMsg{patchDir: tmp, originalDir: origDir, stats: stats, err: err}
+	}
+	if ch != nil {
+		ch <- harnessOutputMsg{at: time.Now(), line: "Exporting commit range...", ch: ch, stage: "export"}
+	}
 	if err := git.FormatPatch(repo, m.rangeSpec, tmp); err != nil {
-		return runResultMsg{err: err}
+		return runResultMsg{patchDir: tmp, originalDir: origDir, stats: stats, err: err}
 	}
 	patches, err := git.PatchFiles(tmp)
 	if err != nil {
-		return runResultMsg{err: err}
+		return runResultMsg{patchDir: tmp, originalDir: origDir, stats: stats, err: err}
+	}
+	if ch != nil {
+		ch <- harnessOutputMsg{at: time.Now(), line: fmt.Sprintf("Generated %d patch files", len(patches)), ch: ch, stage: "patches"}
 	}
 	if len(patches) == 0 {
 		// An empty patch set means the range produced nothing to rewrite;
 		// abort before spawning the harness with no input.
-		return runResultMsg{patchDir: tmp, err: fmt.Errorf("range produced no patches")}
+		return runResultMsg{patchDir: tmp, originalDir: origDir, stats: stats, err: fmt.Errorf("range produced no patches")}
+	}
+	for _, p := range patches {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return runResultMsg{patchDir: tmp, originalDir: origDir, patches: patches, stats: stats, err: fmt.Errorf("preserving original patch %s: %w", filepath.Base(p), err)}
+		}
+		if err := os.WriteFile(filepath.Join(origDir, filepath.Base(p)), data, 0o644); err != nil {
+			return runResultMsg{patchDir: tmp, originalDir: origDir, patches: patches, stats: stats, err: fmt.Errorf("preserving original patch %s: %w", filepath.Base(p), err)}
+		}
 	}
 	m.patches = patches
+	if ch != nil {
+		ch <- harnessOutputMsg{at: time.Now(), line: "Launching harness process...", ch: ch, stage: "harness"}
+	}
 	bin, args := m.h.Command(editPrompt(m.instruction))
 	_, stderr, err := streamCommand(ctx, bin, args, tmp, ch)
 	if err != nil {
-		return runResultMsg{patchDir: tmp, patches: patches, err: harnessErr(err, stderr)}
+		return runResultMsg{patchDir: tmp, originalDir: origDir, patches: patches, stats: stats, err: harnessErr(err, stderr)}
 	}
 	if m.dontModify {
 		if err := checkFinalState(m, tree); err != nil {
-			return runResultMsg{patchDir: tmp, patches: patches, err: err}
+			return runResultMsg{patchDir: tmp, originalDir: origDir, patches: patches, stats: stats, err: err}
 		}
 	}
-	return runResultMsg{patchDir: tmp, patches: patches, tree: tree}
+	return runResultMsg{patchDir: tmp, originalDir: origDir, patches: patches, stats: stats, tree: tree}
 }
 
 // rerunHarness re-runs the harness against the existing patch directory after
@@ -264,17 +296,20 @@ func rerunHarnessResult(m Model, ctx context.Context, ch chan tea.Msg) runResult
 	if m.patchDir == "" || len(m.patches) == 0 {
 		return runResultMsg{err: fmt.Errorf("nothing to reprompt: no patches")}
 	}
+	if ch != nil {
+		ch <- harnessOutputMsg{at: time.Now(), line: "Reprompting harness...", ch: ch, stage: "harness"}
+	}
 	bin, args := m.h.Command(editPrompt(m.instruction))
 	_, stderr, err := streamCommand(ctx, bin, args, m.patchDir, ch)
 	if err != nil {
-		return runResultMsg{patchDir: m.patchDir, patches: m.patches, err: harnessErr(err, stderr)}
+		return runResultMsg{patchDir: m.patchDir, originalDir: m.originalDir, patches: m.patches, err: harnessErr(err, stderr)}
 	}
 	if m.dontModify {
 		if err := checkFinalState(m, m.originalTree); err != nil {
-			return runResultMsg{patchDir: m.patchDir, patches: m.patches, err: err}
+			return runResultMsg{patchDir: m.patchDir, originalDir: m.originalDir, patches: m.patches, err: err}
 		}
 	}
-	return runResultMsg{patchDir: m.patchDir, patches: m.patches}
+	return runResultMsg{patchDir: m.patchDir, originalDir: m.originalDir, patches: m.patches}
 }
 
 // checkFinalState verifies that applying all patches to m.rangeBase yields

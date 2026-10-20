@@ -8,11 +8,18 @@ import (
 
 // Palette used across every screen. Colours are 256-colour ANSI indices
 // understood by lipgloss in any colour profile.
+//
+// accentColor is the amber active accent, dangerColor the red used for
+// deletions/errors, infoColor the cyan used for hunk headers and informational
+// badges, and borderColor the dim border tone that keeps chrome quiet.
 var (
-	accentColor  = lipgloss.Color("63")
-	mutedColor   = lipgloss.Color("241")
-	errorColor   = lipgloss.Color("203")
+	accentColor  = lipgloss.Color("214")
 	successColor = lipgloss.Color("42")
+	dangerColor  = lipgloss.Color("203")
+	infoColor    = lipgloss.Color("81")
+	mutedColor   = lipgloss.Color("244")
+	borderColor  = lipgloss.Color("238")
+	fgColor      = lipgloss.Color("255")
 )
 
 var (
@@ -20,29 +27,46 @@ var (
 	// Width(w-2).Height(h-2) occupies exactly w×h cells.
 	boxStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
 
-	activePaneStyle   = boxStyle.BorderForeground(accentColor)
-	inactivePaneStyle = boxStyle.BorderForeground(mutedColor)
+	panelStyle       = boxStyle.BorderForeground(borderColor)
+	panelActiveStyle = boxStyle.BorderForeground(accentColor)
 
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(accentColor)
-	helpStyle  = lipgloss.NewStyle().Foreground(mutedColor)
-	// statusBarStyle is muted; its width is set per render so the bar spans the
-	// full terminal width.
-	statusBarStyle = lipgloss.NewStyle().Foreground(mutedColor)
-
-	selectedItemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(accentColor)
-
-	errorStyle   = lipgloss.NewStyle().Foreground(errorColor)
+	accentStyle  = lipgloss.NewStyle().Bold(true).Foreground(accentColor)
+	mutedStyle   = lipgloss.NewStyle().Foreground(mutedColor)
+	dangerStyle  = lipgloss.NewStyle().Foreground(dangerColor)
+	hunkStyle    = lipgloss.NewStyle().Foreground(infoColor)
 	successStyle = lipgloss.NewStyle().Foreground(successColor)
+
+	panelTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(accentColor)
+	headerStyle     = lipgloss.NewStyle().Bold(true).Foreground(fgColor)
+	footerStyle     = lipgloss.NewStyle().Foreground(mutedColor)
+	sidebarStyle    = lipgloss.NewStyle().Foreground(fgColor)
+	keycapStyle     = lipgloss.NewStyle().Bold(true).Foreground(accentColor)
+	gutterStyle     = lipgloss.NewStyle().Foreground(borderColor)
+
+	selectedRowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("0")).Background(accentColor)
 )
 
-// renderBox renders body inside a rounded border occupying exactly w×h cells.
-// title, when non-empty, becomes the first content line. Lines longer than the
-// available content width are truncated and the body is padded/trimmed to the
-// available height so the box never overflows.
+// renderBox renders body inside the default rounded border occupying exactly
+// w×h cells. title, when non-empty, becomes the first content line.
 func renderBox(title, body string, w, h int, active bool) string {
-	style := inactivePaneStyle
+	return renderFrame(title, body, w, h, active)
+}
+
+// renderPanel renders body inside a rounded panel occupying exactly w×h cells.
+// The border is amber when active and dim grey otherwise, and the title (when
+// non-empty) becomes the first content line.
+func renderPanel(title, body string, w, h int, active bool) string {
+	return renderFrame(title, body, w, h, active)
+}
+
+// renderFrame is the shared exact-size box implementation behind renderBox and
+// renderPanel. Lines longer than the available content width are truncated and
+// the body is padded/trimmed to the available height so the box never
+// overflows.
+func renderFrame(title, body string, w, h int, active bool) string {
+	style := panelStyle
 	if active {
-		style = activePaneStyle
+		style = panelActiveStyle
 	}
 	if w < 4 {
 		w = 4
@@ -54,7 +78,7 @@ func renderBox(title, body string, w, h int, active bool) string {
 
 	var lines []string
 	if title != "" {
-		lines = append(lines, titleStyle.Render(truncate(title, innerW)))
+		lines = append(lines, panelTitleStyle.Render(truncate(title, innerW)))
 	}
 	for _, line := range strings.Split(body, "\n") {
 		if lipgloss.Width(line) > innerW {
@@ -71,15 +95,6 @@ func renderBox(title, body string, w, h int, active bool) string {
 
 	content := strings.Join(lines, "\n")
 	return style.Width(innerW).Height(innerH).Render(content)
-}
-
-// renderStatusBar renders a single full-width muted status line. The text is
-// clipped to w cells before styling so it never wraps onto a second line.
-func renderStatusBar(w int, text string) string {
-	if w < 1 {
-		w = 1
-	}
-	return statusBarStyle.Width(w).Render(truncate(text, w))
 }
 
 // truncate shortens s to at most w display cells. It walks whole runes (never

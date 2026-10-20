@@ -94,19 +94,34 @@ func flowModel(repo, base string) Model {
 		instruction: "rewrite history",
 		dontModify:  true,
 		rangeInput:  textinput.New(),
-		instrInput:  textinput.New(),
+		instrArea:   textarea.New(),
 		textarea:    textarea.New(),
 		viewport:    viewport.New(viewport.WithWidth(80), viewport.WithHeight(20)),
 		spinner:     spinner.New(),
 	}
-	m.instrInput.SetValue(m.instruction)
+	m.instrArea.SetValue(m.instruction)
 	m.resize()
 	return m
 }
 
 func flowKey(r rune) tea.KeyPressMsg { return tea.KeyPressMsg{Text: string(r), Code: r} }
 
-func flowEnter() tea.KeyPressMsg { return tea.KeyPressMsg{Code: tea.KeyEnter} }
+// flowCtrlEnter is the instruction screen's confirm key; plain enter inserts a
+// newline in the multi-line instruction textarea.
+func flowCtrlEnter() tea.KeyPressMsg {
+	return tea.KeyPressMsg{Code: tea.KeyEnter, Mod: tea.ModCtrl}
+}
+
+// flowStartRun confirms the instruction with ctrl+enter and verifies the flow
+// moved to the run screen.
+func flowStartRun(t *testing.T, m Model) (Model, tea.Cmd) {
+	t.Helper()
+	m, cmd := flowPress(t, m, flowCtrlEnter())
+	if m.screen != scrRun {
+		t.Fatalf("ctrl+enter on the instruction screen: screen = %d, want scrRun", m.screen)
+	}
+	return m, cmd
+}
 
 func flowPress(t *testing.T, m Model, key tea.KeyPressMsg) (Model, tea.Cmd) {
 	t.Helper()
@@ -128,6 +143,15 @@ func flowDrive(t *testing.T, m Model, cmd tea.Cmd, done func(Model) bool) Model 
 			t.Fatal("flowDrive did not terminate")
 		}
 		msg := cmd()
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, c := range batch {
+				m = flowDrive(t, m, c, done)
+				if done(m) {
+					return m
+				}
+			}
+			return m
+		}
 		if msg == nil {
 			break
 		}
@@ -145,7 +169,7 @@ func TestFlowRewritesSubjectsAndPushes(t *testing.T) {
 	flowFakeHarness(t, "sed -i 's/^Subject: .*/Subject: rewritten/' ./*.patch")
 
 	m := flowModel(fr.dir, fr.base)
-	m, cmd := flowPress(t, m, flowEnter())
+	m, cmd := flowStartRun(t, m)
 	m = flowDrive(t, m, cmd, func(m Model) bool { return m.screen == scrReview || m.screen == scrDone })
 	if m.finalErr != nil {
 		t.Fatalf("run failed: %v", m.finalErr)
@@ -188,7 +212,7 @@ func TestFlowFinalStateEnforced(t *testing.T) {
 	flowFakeHarness(t, "sed -i 's/^+line 3$/+line 3 CHANGED/' ./*.patch")
 
 	m := flowModel(fr.dir, fr.base)
-	m, cmd := flowPress(t, m, flowEnter())
+	m, cmd := flowStartRun(t, m)
 	m = flowDrive(t, m, cmd, func(m Model) bool { return m.screen == scrDone })
 	if m.finalErr == nil {
 		t.Fatal("expected a final-state error")

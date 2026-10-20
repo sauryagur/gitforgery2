@@ -14,7 +14,7 @@ func TestPushAbortsWhenHEADMovedAfterReview(t *testing.T) {
 	flowFakeHarness(t, "sed -i 's/^Subject: .*/Subject: rewritten/' ./*.patch")
 
 	m := flowModel(fr.dir, fr.base)
-	m, cmd := flowPress(t, m, flowEnter())
+	m, cmd := flowStartRun(t, m)
 	m = flowDrive(t, m, cmd, func(m Model) bool { return m.screen == scrReview || m.screen == scrDone })
 	if m.finalErr != nil {
 		t.Fatalf("run failed: %v", m.finalErr)

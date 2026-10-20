@@ -26,7 +26,7 @@ func TestPushFailureRestoresBackupRef(t *testing.T) {
 	flowFakeHarness(t, "sed -i 's/^Subject: .*/Subject: rewritten/' ./*.patch")
 
 	m := flowModel(fr.dir, fr.base)
-	m, cmd := flowPress(t, m, flowEnter())
+	m, cmd := flowStartRun(t, m)
 	m = flowDrive(t, m, cmd, func(m Model) bool { return m.screen == scrReview || m.screen == scrDone })
 	if m.finalErr != nil {
 		t.Fatalf("run failed: %v", m.finalErr)
@@ -74,7 +74,7 @@ func TestRepromptKeepsPatchDir(t *testing.T) {
 	flowFakeHarness(t, "sed -i 's/^Subject: .*/Subject: rewritten/' ./*.patch")
 
 	m := flowModel(fr.dir, fr.base)
-	m, cmd := flowPress(t, m, flowEnter())
+	m, cmd := flowStartRun(t, m)
 	m = flowDrive(t, m, cmd, func(m Model) bool { return m.screen == scrReview || m.screen == scrDone })
 	if m.finalErr != nil {
 		t.Fatalf("run failed: %v", m.finalErr)
@@ -97,11 +97,11 @@ func TestRepromptKeepsPatchDir(t *testing.T) {
 	if m.screen != scrInstruction {
 		t.Fatalf("screen = %d, want instruction", m.screen)
 	}
-	if v := strings.TrimSpace(m.instrInput.Value()); v == "" {
+	if v := strings.TrimSpace(m.instrArea.Value()); v == "" {
 		t.Fatal("instruction input is empty after reprompt")
 	}
 
-	m, cmd = flowPress(t, m, flowEnter())
+	m, cmd = flowStartRun(t, m)
 	m = flowDrive(t, m, cmd, func(m Model) bool { return m.screen == scrReview || m.screen == scrDone })
 	if m.finalErr != nil {
 		t.Fatalf("reprompt failed: %v", m.finalErr)
